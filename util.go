@@ -22,24 +22,18 @@ package main
 import (
 	"context"
 	"crypto"
-	crand "crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/LiterMC/go-openbmclapi/log"
 )
 
 var closedCh = func() <-chan struct{} {
@@ -49,21 +43,20 @@ var closedCh = func() <-chan struct{} {
 }()
 
 func createInterval(ctx context.Context, do func(), delay time.Duration) {
+	ticker := time.NewTicker(delay)
+	context.AfterFunc(ctx, func() {
+		ticker.Stop()
+	})
 	go func() {
-		ticker := time.NewTicker(delay)
+		defer log.RecordPanic()
 		defer ticker.Stop()
 
-		for {
+		for range ticker.C {
+			do()
+			// If another a tick passed during the job, ignore it
 			select {
-			case <-ctx.Done():
-				return
 			case <-ticker.C:
-				do()
-				// If another a tick passed during the job, ignore it
-				select {
-				case <-ticker.C:
-				default:
-				}
+			default:
 			}
 		}
 	}()
@@ -165,82 +158,6 @@ func copyFile(src, dst string, mode os.FileMode) (err error) {
 	}
 	defer dstFd.Close()
 	_, err = io.Copy(dstFd, srcFd)
-	return
-}
-
-func checkQuerySign(hash string, secret string, query url.Values) bool {
-	if config.Advanced.SkipSignatureCheck {
-		return true
-	}
-	sign, e := query.Get("s"), query.Get("e")
-	if len(sign) == 0 || len(e) == 0 {
-		return false
-	}
-	before, err := strconv.ParseInt(e, 36, 64)
-	if err != nil {
-		return false
-	}
-	hs := crypto.SHA1.New()
-	io.WriteString(hs, secret)
-	io.WriteString(hs, hash)
-	io.WriteString(hs, e)
-	var (
-		buf  [20]byte
-		sbuf [27]byte
-	)
-	base64.RawURLEncoding.Encode(sbuf[:], hs.Sum(buf[:0]))
-	if (string)(sbuf[:]) != sign {
-		return false
-	}
-	return time.Now().UnixMilli() < before
-}
-
-func comparePasswd(p1, p2 string) bool {
-	a := sha256.Sum256(([]byte)(p1))
-	b := sha256.Sum256(([]byte)(p2))
-	return subtle.ConstantTimeCompare(a[:], b[:]) == 0
-}
-
-// return a URL encoded base64 string
-func asSha256(s string) string {
-	buf := sha256.Sum256(([]byte)(s))
-	return base64.RawURLEncoding.EncodeToString(buf[:])
-}
-
-func asSha256Hex(s string) string {
-	buf := sha256.Sum256(([]byte)(s))
-	return hex.EncodeToString(buf[:])
-}
-
-func genRandB64(n int) (s string, err error) {
-	buf := make([]byte, n)
-	if _, err = crand.Read(buf); err != nil {
-		return
-	}
-	s = base64.RawURLEncoding.EncodeToString(buf)
-	return
-}
-
-func loadOrCreateHmacKey(dataDir string) (key []byte, err error) {
-	path := filepath.Join(dataDir, "server.hmac.private_key")
-	buf, err := os.ReadFile(path)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return
-		}
-		var sbuf string
-		if sbuf, err = genRandB64(256); err != nil {
-			return
-		}
-		buf = ([]byte)(sbuf)
-		if err = os.WriteFile(path, buf, 0600); err != nil {
-			return
-		}
-	}
-	key = make([]byte, base64.RawURLEncoding.DecodedLen(len(buf)))
-	if _, err = base64.RawURLEncoding.Decode(key, buf); err != nil {
-		return
-	}
 	return
 }
 

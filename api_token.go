@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/LiterMC/go-openbmclapi/utils"
 )
 
 const jwtIssuerPrefix = "GOBA.dash.api"
@@ -34,6 +36,8 @@ const jwtIssuerPrefix = "GOBA.dash.api"
 const (
 	tokenTypeKey = "go-openbmclapi.cluster.token.typ"
 	tokenIdKey   = "go-openbmclapi.cluster.token.id"
+
+	loggedUserKey = "go-openbmclapi.cluster.logged.user"
 )
 
 const (
@@ -42,7 +46,17 @@ const (
 )
 
 func getRequestTokenType(req *http.Request) string {
-	return req.Context().Value(tokenTypeKey).(string)
+	if t, ok := req.Context().Value(tokenTypeKey).(string); ok {
+		return t
+	}
+	return ""
+}
+
+func getLoggedUser(req *http.Request) string {
+	if user, ok := req.Context().Value(loggedUserKey).(string); ok {
+		return user
+	}
+	return ""
 }
 
 var (
@@ -62,18 +76,68 @@ func (cr *Cluster) getJWTKey(t *jwt.Token) (any, error) {
 }
 
 const (
-	authTokenSubject = "GOBA-auth"
-	apiTokenSubject  = "GOBA-API"
+	challengeTokenSubject = "GOBA-challenge"
+	authTokenSubject      = "GOBA-auth"
+	apiTokenSubject       = "GOBA-API"
 )
+
+type challengeTokenClaims struct {
+	jwt.RegisteredClaims
+
+	Client string `json:"cli"`
+	Action string `json:"act"`
+}
+
+func (cr *Cluster) generateChallengeToken(cliId string, action string) (string, error) {
+	now := time.Now()
+	exp := now.Add(time.Minute * 1)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &challengeTokenClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   challengeTokenSubject,
+			Issuer:    cr.jwtIssuer,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(exp),
+		},
+		Client: cliId,
+		Action: action,
+	})
+	tokenStr, err := token.SignedString(cr.apiHmacKey)
+	if err != nil {
+		return "", err
+	}
+	return tokenStr, nil
+}
+
+func (cr *Cluster) verifyChallengeToken(cliId string, action string, token string) (err error) {
+	var claims challengeTokenClaims
+	if _, err = jwt.ParseWithClaims(
+		token,
+		&claims,
+		cr.getJWTKey,
+		jwt.WithSubject(challengeTokenSubject),
+		jwt.WithIssuedAt(),
+		jwt.WithIssuer(cr.jwtIssuer),
+	); err != nil {
+		return
+	}
+	if claims.Client != cliId {
+		return ErrClientIdNotMatch
+	}
+	if claims.Action != action {
+		return ErrJTINotExists
+	}
+	return
+}
 
 type authTokenClaims struct {
 	jwt.RegisteredClaims
 
 	Client string `json:"cli"`
+	User   string `json:"usr"`
 }
 
-func (cr *Cluster) generateAuthToken(cliId string) (string, error) {
-	jti, err := genRandB64(16)
+func (cr *Cluster) generateAuthToken(cliId string, userId string) (string, error) {
+	jti, err := utils.GenRandB64(16)
 	if err != nil {
 		return "", err
 	}
@@ -88,6 +152,7 @@ func (cr *Cluster) generateAuthToken(cliId string) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(exp),
 		},
 		Client: cliId,
+		User:   userId,
 	})
 	tokenStr, err := token.SignedString(cr.apiHmacKey)
 	if err != nil {
@@ -99,39 +164,46 @@ func (cr *Cluster) generateAuthToken(cliId string) (string, error) {
 	return tokenStr, nil
 }
 
-func (cr *Cluster) verifyAuthToken(cliId string, token string) (id string, err error) {
+func (cr *Cluster) verifyAuthToken(cliId string, token string) (id string, user string, err error) {
 	var claims authTokenClaims
-	_, err = jwt.ParseWithClaims(
+	if _, err = jwt.ParseWithClaims(
 		token,
 		&claims,
 		cr.getJWTKey,
 		jwt.WithSubject(authTokenSubject),
 		jwt.WithIssuedAt(),
 		jwt.WithIssuer(cr.jwtIssuer),
-	)
-	if err != nil {
+	); err != nil {
 		return
 	}
 	if claims.Client != cliId {
-		return "", ErrClientIdNotMatch
+		err = ErrClientIdNotMatch
+		return
 	}
-	jti := claims.ID
-	if ok, _ := cr.database.ValidJTI(jti); !ok {
-		return "", ErrJTINotExists
+	if user = claims.User; user == "" {
+		// reject old token
+		err = ErrJTINotExists
+		return
 	}
-	return jti, nil
+	id = claims.ID
+	if ok, _ := cr.database.ValidJTI(id); !ok {
+		err = ErrJTINotExists
+		return
+	}
+	return
 }
 
 type apiTokenClaims struct {
 	jwt.RegisteredClaims
 
 	Client      string            `json:"cli"`
+	User        string            `json:"usr"`
 	StrictPath  string            `json:"str-p"`
 	StrictQuery map[string]string `json:"str-q,omitempty"`
 }
 
-func (cr *Cluster) generateAPIToken(cliId string, path string, query map[string]string) (string, error) {
-	jti, err := genRandB64(8)
+func (cr *Cluster) generateAPIToken(cliId string, userId string, path string, query map[string]string) (string, error) {
+	jti, err := utils.GenRandB64(8)
 	if err != nil {
 		return "", err
 	}
@@ -146,6 +218,7 @@ func (cr *Cluster) generateAPIToken(cliId string, path string, query map[string]
 			ExpiresAt: jwt.NewNumericDate(exp),
 		},
 		Client:      cliId,
+		User:        userId,
 		StrictPath:  path,
 		StrictQuery: query,
 	})
@@ -159,7 +232,7 @@ func (cr *Cluster) generateAPIToken(cliId string, path string, query map[string]
 	return tokenStr, nil
 }
 
-func (cr *Cluster) verifyAPIToken(cliId string, token string, path string, query url.Values) (id string, err error) {
+func (cr *Cluster) verifyAPIToken(cliId string, token string, path string, query url.Values) (id string, user string, err error) {
 	var claims apiTokenClaims
 	_, err = jwt.ParseWithClaims(
 		token,
@@ -173,19 +246,27 @@ func (cr *Cluster) verifyAPIToken(cliId string, token string, path string, query
 		return
 	}
 	if claims.Client != cliId {
-		return "", ErrClientIdNotMatch
+		err = ErrClientIdNotMatch
+		return
 	}
-	jti := claims.ID
-	if ok, _ := cr.database.ValidJTI(jti); !ok {
-		return "", ErrJTINotExists
+	if user = claims.User; user == "" {
+		err = ErrJTINotExists
+		return
+	}
+	id = claims.ID
+	if ok, _ := cr.database.ValidJTI(id); !ok {
+		err = ErrJTINotExists
+		return
 	}
 	if claims.StrictPath != path {
-		return "", ErrStrictPathNotMatch
+		err = ErrStrictPathNotMatch
+		return
 	}
 	for k, v := range claims.StrictQuery {
 		if query.Get(k) != v {
-			return "", ErrStrictQueryNotMatch
+			err = ErrStrictQueryNotMatch
+			return
 		}
 	}
-	return jti, nil
+	return
 }

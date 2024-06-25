@@ -21,10 +21,11 @@ Golang 版的 [OpenBmclAPI](https://github.com/bangbang93/openbmclapi)
 - 使用协程/多线程, 超高的文件同步速度
 - ~~不依赖大量的三方包, 体积小巧~~
 - 静态文件, 无需配置任何依赖
-- 得益于 Golang 强大的跨平台编译器, 支持大部分主流平台/处理器
+- 得益于 Golang 强大的跨平台编译器, 支持大部分平台/处理器
 - 内置一个统计面板
 - 支持在面板内实时查看日志 (需登录)
 - 支持自动化打洞程序
+- 支持在节点上线/下线时发送通知
 - 支持一些小众的~~奇怪~~需求
 - ~~更好的压榨节点~~
 
@@ -52,6 +53,9 @@ A: 如果您确定您的存储稳定, 将 `config.yaml` 下的 `no-heavy-check` 
 Q: 程序无法运行 / 直接退出怎么办?  
 A: 请将运行目录下 `logs` 文件夹内最新的日志上传到 [Github Issue](https://github.com/LiterMC/go-openbmclapi/issues/new)
 
+Q: 面板日志一直无法连接?  
+A: 请确认中间所有的反向代理都支持 WebSocket
+
 ## 安装
 
 注意: LiterMC-RootCA 的 SHA1 指纹为 `A2:CB:34:70:25:CF:5D:F6:57:1C:67:81:35:49:7D:6D:A7:26:F7:0E`
@@ -64,7 +68,8 @@ A: 请将运行目录下 `logs` 文件夹内最新的日志上传到 [Github Iss
 
 ### 从docker运行
 
-- 可直接运行仓库目录下的 [`docker-run.sh`](./docker-run.sh) 文件, 运行之前请确保存在`craftmine/go-openbmclapi:latest`镜像, 或网络连通
+- 可直接运行仓库目录下的 [`scripts/docker-run.sh`](./scripts/docker-run.sh) 文件, 运行之前请确保存在`craftmine/go-openbmclapi:latest`镜像, 或网络连通
+- 国内可能屏蔽了 dockerHUB, 可以尝试拉取 `mcdr.waerba.com/go-openbmclapi:latest`
 - 也可使用`docker build -t craftmine/go-openbmclapi:latest .`手动编译镜像
 
 ### 从`systemd`运行 _(仅Linux)_
@@ -72,19 +77,19 @@ A: 请将运行目录下 `logs` 文件夹内最新的日志上传到 [Github Iss
 1. **确保systemd是您的*启动进程***
 2. 执行
    ```sh
-   curl -fsSL ${MIRROR_PREFIX}https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/service/installer.sh | sudo bash -s
+   curl -fsSL https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/installer/service/installer.sh | sudo bash -s
    ```
    > 注意, 新版新增使用 `openbmclapi` 用户执行程序, 可能需要执行 `sudo chown -R openbmclapi /opt/openbmclapi` 指令修复权限
 
    国内对 Github 的支持较差, 可以使用 ghproxy 等镜像站运行脚本, 本例中使用了 [crashmc.com](https://crashmc.com) 提供的 CDN:
    ```sh
    MIRROR_PREFIX=https://cdn.crashmc.com/
-   curl -fsSL ${MIRROR_PREFIX}https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/service/installer.sh | sudo bash -s --mirror "${MIRROR_PREFIX}"
+   curl -fsSL ${MIRROR_PREFIX}https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/installer/service/installer.sh | sudo bash -s -- --mirror "${MIRROR_PREFIX}"
    ```
 
    如果需要下载指定版本, 只需设置 `-t|--tag` 标志即可
    ```sh
-   curl -fsSL ${MIRROR_PREFIX}https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/service/installer.sh | sudo bash -s --tag v1.9.7-8
+   curl -fsSL https://raw.githubusercontent.com/LiterMC/go-openbmclapi/HEAD/installer/service/installer.sh | sudo bash -s -- --tag v1.9.7-8
    ```
 3. 配置`/opt/openbmclapi/config.yaml`配置文件
 4. 使用`systemctl start go-openbmclapi.service`启动服务
@@ -192,6 +197,35 @@ serve-limit:
   # 上行速率限制 (KiB/s), 0 表示无限制
   upload-rate: 0
 
+# API 速率限制. 注意: 该功能仅限制对 /api 路径的访问, 不会影响 openbmclapi 基本功能
+api-rate-limit:
+  # 未登录用户的速率限制, 以访问 IP 为准 (会被 trusted-x-forwarded-for 标志影响)
+  anonymous:
+    per-minute: 10 # 每分钟最多请求数, 0 表示不限制
+    per-hour: 120  # 每小时最多请求数, 0 表示不限制
+  # 已登录用户的速率限制, 以用户名为准
+  logged:
+    per-minute: 120
+    per-hour: 6000
+
+# 通知设置
+notification:
+  # 启用邮件通知
+  enable-email: false
+  # 邮件 SMTP 服务器及其端口
+  email-smtp: smtp.example.com:25
+  # SMTP 服务器加密类型
+  # - none : 无加密
+  # - ssl  : 使用 SSL/TLS 加密
+  # - tls  : 使用 STARTTLS 加密
+  email-smtp-encryption: tls
+  # 通知者邮箱用户名
+  email-sender: noreply@example.com
+  # 通知者邮箱密码
+  email-sender-password: example-password
+  # 启用 Webhook (TODO)
+  enable-webhook: true
+
 # 内置的仪表板
 dashboard:
   # 是否启用
@@ -206,12 +240,24 @@ dashboard:
   pwa-short_name: GOBA Dash
   # PWA 描述
   pwa-description: Go-Openbmclapi Internal Dashboard
+  # 签名推送 JWT 时的 subject, 请将其设为 "mailto:<您的邮箱>" 或 "https://<您的域名>"
+  notification-subject: mailto:user@example.com
+
+# Github API 客户端配置
+github-api:
+  # 更新检测间隔
+  update-check-interval: 1h0m0s
+  # Github API 访问令牌, 绕过IP速率限制
+  # 请访问 <https://github.com/settings/tokens> 生成新的无权限令牌
+  authorization: Bearer ghp_xxxx
 
 # 数据库
 database:
   # 数据库驱动, 可选值有:
   # - memory # 内存数据库, 无持久化, 不需 DSN
-  # - sqlite # sqlite 文件存储. DSN 为文件路径
+  # - sqlite   # sqlite 文件存储. DSN 为文件路径
+  # - mysql    # MySQL, DSN 见 <https://github.com/go-sql-driver/mysql?tab=readme-ov-file#dsn-data-source-name>
+  # - postgres # PostgreSQL, DSN 见 <https://pkg.go.dev/github.com/lib/pq#hdr-Connection_String_Parameters>
   driver: sqlite
   # 数据库的 DSN. 请参考上文
   data-source-name: files.db
@@ -323,6 +369,10 @@ advanced:
   no-fast-enable: false
   # 上线前等待几秒
   wait-before-enable: 0
+  # ⚠️ 不进行安全域名重定向
+  do-NOT-redirect-https-to-SECURE-hostname: false
+  # ⚠️ 当您阅读完全部 README 后, 将该选项设为 true 即可避免打开浏览器
+  do-not-open-faq-on-windows: false
 
 ```
 

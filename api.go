@@ -20,12 +20,17 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -33,9 +38,14 @@ import (
 
 	"runtime/pprof"
 	// "github.com/gorilla/websocket"
+	"github.com/google/uuid"
 
+	"github.com/LiterMC/go-openbmclapi/database"
 	"github.com/LiterMC/go-openbmclapi/internal/build"
+	"github.com/LiterMC/go-openbmclapi/limited"
 	"github.com/LiterMC/go-openbmclapi/log"
+	"github.com/LiterMC/go-openbmclapi/notify"
+	"github.com/LiterMC/go-openbmclapi/utils"
 )
 
 const (
@@ -55,7 +65,7 @@ func (cr *Cluster) cliIdHandle(next http.Handler) http.Handler {
 			id = cid.Value
 		} else {
 			var err error
-			id, err = genRandB64(16)
+			id, err = utils.GenRandB64(16)
 			if err != nil {
 				http.Error(rw, "cannot generate random number", http.StatusInternalServerError)
 				return
@@ -68,58 +78,58 @@ func (cr *Cluster) cliIdHandle(next http.Handler) http.Handler {
 				HttpOnly: true,
 			})
 		}
-		req = req.WithContext(context.WithValue(req.Context(), clientIdKey, asSha256(id)))
+		req = req.WithContext(context.WithValue(req.Context(), clientIdKey, utils.AsSha256(id)))
 		next.ServeHTTP(rw, req)
 	})
 }
 
+func (cr *Cluster) authMiddleware(rw http.ResponseWriter, req *http.Request, next http.Handler) {
+	cli := apiGetClientId(req)
+
+	ctx := req.Context()
+
+	var (
+		id  string
+		uid string
+		err error
+	)
+	if req.Method == http.MethodGet {
+		if tk := req.URL.Query().Get("_t"); tk != "" {
+			path := GetRequestRealPath(req)
+			if id, uid, err = cr.verifyAPIToken(cli, tk, path, req.URL.Query()); err == nil {
+				ctx = context.WithValue(ctx, tokenTypeKey, tokenTypeAPI)
+			}
+		}
+	}
+	if id == "" {
+		auth := req.Header.Get("Authorization")
+		tk, ok := strings.CutPrefix(auth, "Bearer ")
+		if !ok {
+			if err == nil {
+				err = ErrUnsupportAuthType
+			}
+		} else if id, uid, err = cr.verifyAuthToken(cli, tk); err != nil {
+			id = ""
+		} else {
+			ctx = context.WithValue(ctx, tokenTypeKey, tokenTypeAuth)
+		}
+	}
+	if id != "" {
+		ctx = context.WithValue(ctx, loggedUserKey, uid)
+		ctx = context.WithValue(ctx, tokenIdKey, id)
+		req = req.WithContext(ctx)
+	}
+	next.ServeHTTP(rw, req)
+}
+
 func (cr *Cluster) apiAuthHandle(next http.Handler) http.Handler {
 	return (http.HandlerFunc)(func(rw http.ResponseWriter, req *http.Request) {
-		if !config.Dashboard.Enable {
-			writeJson(rw, http.StatusServiceUnavailable, Map{
-				"error": "dashboard is disabled in the config",
+		if req.Context().Value(tokenTypeKey) == nil {
+			writeJson(rw, http.StatusUnauthorized, Map{
+				"error": "403 Unauthorized",
 			})
 			return
 		}
-		cli := apiGetClientId(req)
-
-		ctx := req.Context()
-
-		var (
-			id  string
-			err error
-		)
-		if req.Method == http.MethodGet {
-			if tk := req.URL.Query().Get("_t"); tk != "" {
-				path := GetRequestRealPath(req)
-				log.Debugf("Verifying API token at %s", path)
-				if id, err = cr.verifyAPIToken(cli, tk, path, req.URL.Query()); id != "" {
-					ctx = context.WithValue(ctx, tokenTypeKey, tokenTypeAPI)
-				}
-			}
-		}
-		if id == "" {
-			auth := req.Header.Get("Authorization")
-			tk, ok := strings.CutPrefix(auth, "Bearer ")
-			if !ok {
-				if err == nil {
-					err = ErrUnsupportAuthType
-				}
-				writeJson(rw, http.StatusUnauthorized, Map{
-					"error": err.Error(),
-				})
-				return
-			}
-			if id, err = cr.verifyAuthToken(cli, tk); err != nil {
-				writeJson(rw, http.StatusUnauthorized, Map{
-					"error": "invalid authorization token",
-				})
-				return
-			}
-			ctx = context.WithValue(ctx, tokenTypeKey, tokenTypeAuth)
-		}
-		ctx = context.WithValue(ctx, tokenIdKey, id)
-		req = req.WithContext(ctx)
 		next.ServeHTTP(rw, req)
 	})
 }
@@ -137,33 +147,63 @@ func (cr *Cluster) initAPIv0() http.Handler {
 		})
 	})
 
-	mux.HandleFunc("/ping", cr.apiV0Ping)
+	mux.HandleFunc("/ping", cr.apiV1Ping)
 	mux.HandleFunc("/status", cr.apiV0Status)
+	mux.Handle("/stat/", http.StripPrefix("/stat/", (http.HandlerFunc)(cr.apiV0Stat)))
 
+	mux.HandleFunc("/challenge", cr.apiV1Challenge)
 	mux.HandleFunc("/login", cr.apiV0Login)
 	mux.Handle("/requestToken", cr.apiAuthHandleFunc(cr.apiV0RequestToken))
-	mux.Handle("/logout", cr.apiAuthHandleFunc(cr.apiV0Logout))
+	mux.Handle("/logout", cr.apiAuthHandleFunc(cr.apiV1Logout))
 
-	mux.HandleFunc("/log.io", cr.apiV0LogIO)
-	mux.Handle("/pprof", cr.apiAuthHandleFunc(cr.apiV0Pprof))
-	return mux
+	mux.HandleFunc("/log.io", cr.apiV1LogIO)
+	mux.Handle("/pprof", cr.apiAuthHandleFunc(cr.apiV1Pprof))
+	mux.HandleFunc("/subscribeKey", cr.apiV0SubscribeKey)
+	mux.Handle("/subscribe", cr.apiAuthHandleFunc(cr.apiV0Subscribe))
+	mux.Handle("/subscribe_email", cr.apiAuthHandleFunc(cr.apiV0SubscribeEmail))
+	mux.Handle("/webhook", cr.apiAuthHandleFunc(cr.apiV0Webhook))
+
+	mux.Handle("/log_files", cr.apiAuthHandleFunc(cr.apiV0LogFiles))
+	mux.Handle("/log_file/", cr.apiAuthHandle(http.StripPrefix("/log_file/", (http.HandlerFunc)(cr.apiV0LogFile))))
+
+	next := cr.apiRateLimiter.WrapHandler(mux)
+	return (http.HandlerFunc)(func(rw http.ResponseWriter, req *http.Request) {
+		cr.authMiddleware(rw, req, next)
+	})
 }
 
-func (cr *Cluster) apiV0Ping(rw http.ResponseWriter, req *http.Request) {
+func (cr *Cluster) initAPIv1() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
+		writeJson(rw, http.StatusNotFound, Map{
+			"error": "404 not found",
+			"path":  req.URL.Path,
+		})
+	})
+
+	mux.HandleFunc("/ping", cr.apiV1Ping)
+
+	mux.HandleFunc("/challenge", cr.apiV1Challenge)
+	mux.Handle("/logout", cr.apiAuthHandleFunc(cr.apiV1Logout))
+
+	mux.HandleFunc("/log.io", cr.apiV1LogIO)
+	mux.Handle("/pprof", cr.apiAuthHandleFunc(cr.apiV1Pprof))
+
+	next := cr.apiRateLimiter.WrapHandler(mux)
+	return (http.HandlerFunc)(func(rw http.ResponseWriter, req *http.Request) {
+		cr.authMiddleware(rw, req, next)
+	})
+}
+
+func (cr *Cluster) apiV1Ping(rw http.ResponseWriter, req *http.Request) {
 	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
 		return
 	}
-	authed := false
-	cli := apiGetClientId(req)
-	auth := req.Header.Get("Authorization")
-	if tk, ok := strings.CutPrefix(auth, "Bearer "); ok {
-		if _, err := cr.verifyAuthToken(cli, tk); err == nil {
-			authed = true
-		}
-	}
+	limited.SetSkipRateLimit(req)
+	authed := getRequestTokenType(req) == tokenTypeAuth
 	writeJson(rw, http.StatusOK, Map{
 		"version": build.BuildVersion,
-		"time":    time.Now(),
+		"time":    time.Now().UnixMilli(),
 		"authed":  authed,
 	})
 }
@@ -172,22 +212,29 @@ func (cr *Cluster) apiV0Status(rw http.ResponseWriter, req *http.Request) {
 	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
 		return
 	}
+	limited.SetSkipRateLimit(req)
 	type syncData struct {
 		Prog  int64 `json:"prog"`
 		Total int64 `json:"total"`
 	}
 	type statusData struct {
-		StartAt time.Time `json:"startAt"`
-		Stats   *Stats    `json:"stats"`
-		Enabled bool      `json:"enabled"`
-		IsSync  bool      `json:"isSync"`
-		Sync    *syncData `json:"sync,omitempty"`
+		StartAt  time.Time     `json:"startAt"`
+		Stats    *notify.Stats `json:"stats"`
+		Enabled  bool          `json:"enabled"`
+		IsSync   bool          `json:"isSync"`
+		Sync     *syncData     `json:"sync,omitempty"`
+		Storages []string      `json:"storages"`
+	}
+	storages := make([]string, len(cr.storageOpts))
+	for i, opt := range cr.storageOpts {
+		storages[i] = opt.Id
 	}
 	status := statusData{
-		StartAt: startTime,
-		Stats:   &cr.stats,
-		Enabled: cr.enabled.Load(),
-		IsSync:  cr.issync.Load(),
+		StartAt:  startTime,
+		Stats:    &cr.stats,
+		Enabled:  cr.enabled.Load(),
+		IsSync:   cr.issync.Load(),
+		Storages: storages,
 	}
 	if status.IsSync {
 		status.Sync = &syncData{
@@ -196,6 +243,46 @@ func (cr *Cluster) apiV0Status(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 	writeJson(rw, http.StatusOK, &status)
+}
+
+func (cr *Cluster) apiV0Stat(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
+		return
+	}
+	limited.SetSkipRateLimit(req)
+	name := req.URL.Path
+	if name == "" {
+		rw.Header().Set("Cache-Control", "public, max-age=60")
+		writeJson(rw, http.StatusOK, &cr.stats)
+		return
+	}
+	data, err := cr.stats.MarshalSubStat(name)
+	if err != nil {
+		http.Error(rw, "Error when encoding response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rw.Header().Set("Cache-Control", "public, max-age=30")
+	writeJson(rw, http.StatusOK, (json.RawMessage)(data))
+}
+
+func (cr *Cluster) apiV1Challenge(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
+		return
+	}
+	cli := apiGetClientId(req)
+	query := req.URL.Query()
+	action := query.Get("action")
+	token, err := cr.generateChallengeToken(cli, action)
+	if err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "Cannot generate token",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJson(rw, http.StatusOK, Map{
+		"token": token,
+	})
 }
 
 func (cr *Cluster) apiV0Login(rw http.ResponseWriter, req *http.Request) {
@@ -210,40 +297,23 @@ func (cr *Cluster) apiV0Login(rw http.ResponseWriter, req *http.Request) {
 	}
 	cli := apiGetClientId(req)
 
-	var (
-		authUser, authPass string
-	)
-	ct, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
-	if err != nil {
-		writeJson(rw, http.StatusBadRequest, Map{
-			"error":        "Unexpected Content-Type",
-			"content-type": req.Header.Get("Content-Type"),
-			"message":      err.Error(),
-		})
-		return
+	type T = struct {
+		User      string `json:"username"`
+		Challenge string `json:"challenge"`
+		Signature string `json:"signature"`
 	}
-	switch ct {
-	case "application/x-www-form-urlencoded":
-		authUser = req.PostFormValue("username")
-		authPass = req.PostFormValue("password")
-	case "application/json":
-		var data struct {
-			User string `json:"username"`
-			Pass string `json:"password"`
+	data, ok := parseRequestBody(rw, req, func(rw http.ResponseWriter, req *http.Request, ct string, data *T) error {
+		switch ct {
+		case "application/x-www-form-urlencoded":
+			data.User = req.PostFormValue("username")
+			data.Challenge = req.PostFormValue("challenge")
+			data.Signature = req.PostFormValue("signature")
+			return nil
+		default:
+			return errUnknownContent
 		}
-		if err := json.NewDecoder(req.Body).Decode(&data); err != nil {
-			writeJson(rw, http.StatusBadRequest, Map{
-				"error":   "Cannot decode json body",
-				"message": err.Error(),
-			})
-			return
-		}
-		authUser, authPass = data.User, data.Pass
-	default:
-		writeJson(rw, http.StatusBadRequest, Map{
-			"error":        "Unexpected Content-Type",
-			"content-type": ct,
-		})
+	})
+	if !ok {
 		return
 	}
 
@@ -254,15 +324,23 @@ func (cr *Cluster) apiV0Login(rw http.ResponseWriter, req *http.Request) {
 		})
 		return
 	}
-	expectPassword = asSha256Hex(expectPassword)
-	if subtle.ConstantTimeCompare(([]byte)(expectUsername), ([]byte)(authUser)) == 0 ||
-		subtle.ConstantTimeCompare(([]byte)(expectPassword), ([]byte)(authPass)) == 0 {
+
+	if err := cr.verifyChallengeToken(cli, "login", data.Challenge); err != nil {
+		writeJson(rw, http.StatusUnauthorized, Map{
+			"error": "Invalid challenge",
+		})
+		return
+	}
+	expectPassword = utils.AsSha256Hex(expectPassword)
+	expectSignature := utils.HMACSha256Hex(expectPassword, data.Challenge)
+	if subtle.ConstantTimeCompare(([]byte)(expectUsername), ([]byte)(data.User)) == 0 ||
+		subtle.ConstantTimeCompare(([]byte)(expectSignature), ([]byte)(data.Signature)) == 0 {
 		writeJson(rw, http.StatusUnauthorized, Map{
 			"error": "The username or password is incorrect",
 		})
 		return
 	}
-	token, err := cr.generateAuthToken(cli)
+	token, err := cr.generateAuthToken(cli, data.User)
 	if err != nil {
 		writeJson(rw, http.StatusInternalServerError, Map{
 			"error":   "Cannot generate token",
@@ -306,7 +384,8 @@ func (cr *Cluster) apiV0RequestToken(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 	cli := apiGetClientId(req)
-	token, err := cr.generateAPIToken(cli, payload.Path, payload.Query)
+	user := getLoggedUser(req)
+	token, err := cr.generateAPIToken(cli, user, payload.Path, payload.Query)
 	if err != nil {
 		writeJson(rw, http.StatusInternalServerError, Map{
 			"error":   "cannot generate token",
@@ -319,16 +398,17 @@ func (cr *Cluster) apiV0RequestToken(rw http.ResponseWriter, req *http.Request) 
 	})
 }
 
-func (cr *Cluster) apiV0Logout(rw http.ResponseWriter, req *http.Request) {
+func (cr *Cluster) apiV1Logout(rw http.ResponseWriter, req *http.Request) {
 	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodPost) {
 		return
 	}
+	limited.SetSkipRateLimit(req)
 	tid := req.Context().Value(tokenIdKey).(string)
 	cr.database.RemoveJTI(tid)
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
+func (cr *Cluster) apiV1LogIO(rw http.ResponseWriter, req *http.Request) {
 	addr, _ := req.Context().Value(RealAddrCtxKey).(string)
 
 	conn, err := cr.wsUpgrader.Upgrade(rw, req, nil)
@@ -344,20 +424,21 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithCancel(req.Context())
 	defer cancel()
 
-	conn.SetReadLimit(1024 * 8)
-	pongCh := make(chan struct{}, 1)
+	conn.SetReadLimit(1024 * 4)
+	pongTimeoutTimer := time.NewTimer(time.Second * 75)
 	go func() {
 		defer conn.Close()
 		defer cancel()
-		for {
-			select {
-			case <-pongCh:
-			case <-time.After(time.Second * 75):
-				log.Error("[log.io]: Did not receive PONG from remote for 75s")
-				return
-			case <-ctx.Done():
+		defer pongTimeoutTimer.Stop()
+		select {
+		case _, ok := <-pongTimeoutTimer.C:
+			if !ok {
 				return
 			}
+			log.Error("[log.io]: Did not receive packet from client longer than 75s")
+			return
+		case <-ctx.Done():
+			return
 		}
 	}()
 
@@ -382,8 +463,7 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
-	tid, _ := cr.verifyAuthToken(cli, authData.Token)
-	if tid == "" {
+	if _, _, err = cr.verifyAuthToken(cli, authData.Token); err != nil {
 		conn.WriteJSON(Map{
 			"type":    "error",
 			"message": "auth failed",
@@ -423,6 +503,7 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 	defer unregister()
 
 	go func() {
+		defer log.RecoverPanic(nil)
 		defer conn.Close()
 		defer cancel()
 		var data map[string]any
@@ -439,10 +520,7 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 			switch typ {
 			case "pong":
 				log.Debugf("[log.io]: received PONG from %s: %v", addr, data["data"])
-				select {
-				case pongCh <- struct{}{}:
-				default:
-				}
+				pongTimeoutTimer.Reset(time.Second * 75)
 			case "set-level":
 				l, ok := data["level"].(string)
 				if ok {
@@ -490,17 +568,16 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 
 	pingTicker := time.NewTicker(time.Second * 45)
 	defer pingTicker.Stop()
-	forceSendTimer := time.NewTimer(0)
-	defer forceSendTimer.Stop()
+	forceSendTimer := time.NewTimer(time.Second)
+	if !forceSendTimer.Stop() {
+		<-forceSendTimer.C
+	}
 
 	batchMsg := make([]any, 0, 64)
 	for {
 		select {
 		case v := <-sendMsgCh:
 			batchMsg = append(batchMsg, v)
-			if !forceSendTimer.Stop() {
-				<-forceSendTimer.C
-			}
 			forceSendTimer.Reset(time.Second)
 		WAIT_MORE:
 			for {
@@ -508,9 +585,15 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 				case v := <-sendMsgCh:
 					batchMsg = append(batchMsg, v)
 				case <-time.After(time.Millisecond * 20):
+					if !forceSendTimer.Stop() {
+						<-forceSendTimer.C
+					}
 					break WAIT_MORE
 				case <-forceSendTimer.C:
 					break WAIT_MORE
+				case <-ctx.Done():
+					forceSendTimer.Stop()
+					return
 				}
 			}
 			if len(batchMsg) == 1 {
@@ -541,7 +624,7 @@ func (cr *Cluster) apiV0LogIO(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (cr *Cluster) apiV0Pprof(rw http.ResponseWriter, req *http.Request) {
+func (cr *Cluster) apiV1Pprof(rw http.ResponseWriter, req *http.Request) {
 	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
 		return
 	}
@@ -578,7 +661,499 @@ func (cr *Cluster) apiV0Pprof(rw http.ResponseWriter, req *http.Request) {
 	p.WriteTo(rw, debug)
 }
 
+func (cr *Cluster) apiV0SubscribeKey(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
+		return
+	}
+	key := cr.webpushKeyB64
+	etag := `"` + utils.AsSha256(key) + `"`
+	rw.Header().Set("ETag", etag)
+	if cachedTag := req.Header.Get("If-None-Match"); cachedTag == etag {
+		rw.WriteHeader(http.StatusNotModified)
+		return
+	}
+	writeJson(rw, http.StatusOK, Map{
+		"publicKey": key,
+	})
+}
+
+func (cr *Cluster) apiV0Subscribe(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet, http.MethodPost, http.MethodDelete) {
+		return
+	}
+	cliId := apiGetClientId(req)
+	user := getLoggedUser(req)
+	if user == "" {
+		writeJson(rw, http.StatusForbidden, Map{
+			"error": "Unauthorized",
+		})
+		return
+	}
+	switch req.Method {
+	case http.MethodGet:
+		cr.apiV0SubscribeGET(rw, req, user, cliId)
+	case http.MethodPost:
+		cr.apiV0SubscribePOST(rw, req, user, cliId)
+	case http.MethodDelete:
+		cr.apiV0SubscribeDELETE(rw, req, user, cliId)
+	default:
+		panic("unreachable")
+	}
+}
+
+func (cr *Cluster) apiV0SubscribeGET(rw http.ResponseWriter, req *http.Request, user string, client string) {
+	record, err := cr.database.GetSubscribe(user, client)
+	if err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no subscription was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJson(rw, http.StatusOK, Map{
+		"scopes":   record.Scopes,
+		"reportAt": record.ReportAt,
+	})
+}
+
+func (cr *Cluster) apiV0SubscribePOST(rw http.ResponseWriter, req *http.Request, user string, client string) {
+	data, ok := parseRequestBody[database.SubscribeRecord](rw, req, nil)
+	if !ok {
+		return
+	}
+	data.User = user
+	data.Client = client
+	if err := cr.database.SetSubscribe(data); err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "Database update failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0SubscribeDELETE(rw http.ResponseWriter, req *http.Request, user string, client string) {
+	if err := cr.database.RemoveSubscribe(user, client); err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no subscription was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0SubscribeEmail(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete) {
+		return
+	}
+	user := getLoggedUser(req)
+	if user == "" {
+		writeJson(rw, http.StatusForbidden, Map{
+			"error": "Unauthorized",
+		})
+		return
+	}
+	switch req.Method {
+	case http.MethodGet:
+		cr.apiV0SubscribeEmailGET(rw, req, user)
+	case http.MethodPost:
+		cr.apiV0SubscribeEmailPOST(rw, req, user)
+	case http.MethodPatch:
+		cr.apiV0SubscribeEmailPATCH(rw, req, user)
+	case http.MethodDelete:
+		cr.apiV0SubscribeEmailDELETE(rw, req, user)
+	default:
+		panic("unreachable")
+	}
+}
+
+func (cr *Cluster) apiV0SubscribeEmailGET(rw http.ResponseWriter, req *http.Request, user string) {
+	if addr := req.URL.Query().Get("addr"); addr != "" {
+		record, err := cr.database.GetEmailSubscription(user, addr)
+		if err != nil {
+			if err == database.ErrNotFound {
+				writeJson(rw, http.StatusNotFound, Map{
+					"error": "no email subscription was found",
+				})
+				return
+			}
+			writeJson(rw, http.StatusInternalServerError, Map{
+				"error":   "database error",
+				"message": err.Error(),
+			})
+			return
+		}
+		writeJson(rw, http.StatusOK, record)
+		return
+	}
+	records := make([]database.EmailSubscriptionRecord, 0, 4)
+	if err := cr.database.ForEachUsersEmailSubscription(user, func(rec *database.EmailSubscriptionRecord) error {
+		records = append(records, *rec)
+		return nil
+	}); err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJson(rw, http.StatusOK, records)
+}
+
+func (cr *Cluster) apiV0SubscribeEmailPOST(rw http.ResponseWriter, req *http.Request, user string) {
+	data, ok := parseRequestBody[database.EmailSubscriptionRecord](rw, req, nil)
+	if !ok {
+		return
+	}
+
+	data.User = user
+	if err := cr.database.AddEmailSubscription(data); err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "Database update failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusCreated)
+}
+
+func (cr *Cluster) apiV0SubscribeEmailPATCH(rw http.ResponseWriter, req *http.Request, user string) {
+	addr := req.URL.Query().Get("addr")
+	data, ok := parseRequestBody[database.EmailSubscriptionRecord](rw, req, nil)
+	if !ok {
+		return
+	}
+	data.User = user
+	data.Addr = addr
+	if err := cr.database.UpdateEmailSubscription(data); err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no email subscription was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0SubscribeEmailDELETE(rw http.ResponseWriter, req *http.Request, user string) {
+	addr := req.URL.Query().Get("addr")
+	if err := cr.database.RemoveEmailSubscription(user, addr); err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no email subscription was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0Webhook(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete) {
+		return
+	}
+	user := getLoggedUser(req)
+	if user == "" {
+		writeJson(rw, http.StatusForbidden, Map{
+			"error": "Unauthorized",
+		})
+		return
+	}
+	switch req.Method {
+	case http.MethodGet:
+		cr.apiV0WebhookGET(rw, req, user)
+	case http.MethodPost:
+		cr.apiV0WebhookPOST(rw, req, user)
+	case http.MethodPatch:
+		cr.apiV0WebhookPATCH(rw, req, user)
+	case http.MethodDelete:
+		cr.apiV0WebhookDELETE(rw, req, user)
+	default:
+		panic("unreachable")
+	}
+}
+
+func (cr *Cluster) apiV0WebhookGET(rw http.ResponseWriter, req *http.Request, user string) {
+	if sid := req.URL.Query().Get("id"); sid != "" {
+		id, err := uuid.Parse(sid)
+		if err != nil {
+			writeJson(rw, http.StatusBadRequest, Map{
+				"error":   "uuid format error",
+				"message": err.Error(),
+			})
+			return
+		}
+		record, err := cr.database.GetWebhook(user, id)
+		if err != nil {
+			if err == database.ErrNotFound {
+				writeJson(rw, http.StatusNotFound, Map{
+					"error": "no webhook was found",
+				})
+				return
+			}
+			writeJson(rw, http.StatusInternalServerError, Map{
+				"error":   "database error",
+				"message": err.Error(),
+			})
+			return
+		}
+		writeJson(rw, http.StatusOK, record)
+		return
+	}
+	records := make([]database.WebhookRecord, 0, 4)
+	if err := cr.database.ForEachUsersWebhook(user, func(rec *database.WebhookRecord) error {
+		records = append(records, *rec)
+		return nil
+	}); err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJson(rw, http.StatusOK, records)
+}
+
+func (cr *Cluster) apiV0WebhookPOST(rw http.ResponseWriter, req *http.Request, user string) {
+	data, ok := parseRequestBody[database.WebhookRecord](rw, req, nil)
+	if !ok {
+		return
+	}
+
+	data.User = user
+	if err := cr.database.AddWebhook(data); err != nil {
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "Database update failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusCreated)
+}
+
+func (cr *Cluster) apiV0WebhookPATCH(rw http.ResponseWriter, req *http.Request, user string) {
+	id := req.URL.Query().Get("id")
+	data, ok := parseRequestBody[database.WebhookRecord](rw, req, nil)
+	if !ok {
+		return
+	}
+	data.User = user
+	var err error
+	if data.Id, err = uuid.Parse(id); err != nil {
+		writeJson(rw, http.StatusBadRequest, Map{
+			"error":   "uuid format error",
+			"message": err.Error(),
+		})
+		return
+	}
+	if err := cr.database.UpdateWebhook(data); err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no webhook was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0WebhookDELETE(rw http.ResponseWriter, req *http.Request, user string) {
+	id, err := uuid.Parse(req.URL.Query().Get("id"))
+	if err != nil {
+		writeJson(rw, http.StatusBadRequest, Map{
+			"error":   "uuid format error",
+			"message": err.Error(),
+		})
+		return
+	}
+	if err := cr.database.RemoveWebhook(user, id); err != nil {
+		if err == database.ErrNotFound {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error": "no webhook was found",
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "database error",
+			"message": err.Error(),
+		})
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (cr *Cluster) apiV0LogFiles(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet) {
+		return
+	}
+	files := log.ListLogs()
+	type FileInfo struct {
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+	}
+	data := make([]FileInfo, 0, len(files))
+	for _, file := range files {
+		if s, err := os.Stat(filepath.Join(log.BaseDir(), file)); err == nil {
+			data = append(data, FileInfo{
+				Name: file,
+				Size: s.Size(),
+			})
+		}
+	}
+	writeJson(rw, http.StatusOK, Map{
+		"files": data,
+	})
+}
+
+func (cr *Cluster) apiV0LogFile(rw http.ResponseWriter, req *http.Request) {
+	if checkRequestMethodOrRejectWithJson(rw, req, http.MethodGet, http.MethodHead) {
+		return
+	}
+	query := req.URL.Query()
+	fd, err := os.Open(filepath.Join(log.BaseDir(), req.URL.Path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeJson(rw, http.StatusNotFound, Map{
+				"error":   "file not exists",
+				"message": "Cannot find log file",
+				"path":    req.URL.Path,
+			})
+			return
+		}
+		writeJson(rw, http.StatusInternalServerError, Map{
+			"error":   "cannot open file",
+			"message": err.Error(),
+		})
+		return
+	}
+	defer fd.Close()
+	name := filepath.Base(req.URL.Path)
+	isGzip := filepath.Ext(name) == ".gz"
+	if query.Get("no_encrypt") == "1" {
+		var modTime time.Time
+		if stat, err := fd.Stat(); err == nil {
+			modTime = stat.ModTime()
+		}
+		rw.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=600")
+		if isGzip {
+			rw.Header().Set("Content-Type", "application/octet-stream")
+		} else {
+			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		}
+		rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+		http.ServeContent(rw, req, name, modTime, fd)
+	} else {
+		if !isGzip {
+			name += ".gz"
+		}
+		rw.Header().Set("Content-Type", "application/octet-stream")
+		rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name+".encrypted"))
+		cr.apiV0LogFileEncrypted(rw, req, fd, !isGzip)
+	}
+}
+
+func (cr *Cluster) apiV0LogFileEncrypted(rw http.ResponseWriter, req *http.Request, r io.Reader, useGzip bool) {
+	rw.WriteHeader(http.StatusOK)
+	if req.Method == http.MethodHead {
+		return
+	}
+	if useGzip {
+		pr, pw := io.Pipe()
+		defer pr.Close()
+		go func(r io.Reader) {
+			gw := gzip.NewWriter(pw)
+			if _, err := io.Copy(gw, r); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			if err := gw.Close(); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			pw.Close()
+		}(r)
+		r = pr
+	}
+	if err := utils.EncryptStream(rw, r, utils.DeveloporPublicKey); err != nil {
+		log.Errorf("Cannot write encrypted log stream: %v", err)
+	}
+}
+
 type Map = map[string]any
+
+var errUnknownContent = errors.New("unknown content-type")
+
+type requestBodyParser[T any] func(rw http.ResponseWriter, req *http.Request, contentType string, data *T) error
+
+func parseRequestBody[T any](rw http.ResponseWriter, req *http.Request, fallback requestBodyParser[T]) (data T, parsed bool) {
+	contentType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	if err != nil {
+		writeJson(rw, http.StatusBadRequest, Map{
+			"error":        "Unexpected Content-Type",
+			"content-type": req.Header.Get("Content-Type"),
+			"message":      err.Error(),
+		})
+		return
+	}
+	switch contentType {
+	case "application/json":
+		if err := json.NewDecoder(req.Body).Decode(&data); err != nil {
+			writeJson(rw, http.StatusBadRequest, Map{
+				"error":   "Cannot decode request body",
+				"message": err.Error(),
+			})
+			return
+		}
+		return data, true
+	default:
+		if fallback != nil {
+			if err := fallback(rw, req, contentType, &data); err == nil {
+				return data, true
+			} else if err != errUnknownContent {
+				writeJson(rw, http.StatusBadRequest, Map{
+					"error":   "Cannot decode request body",
+					"message": err.Error(),
+				})
+				return
+			}
+		}
+		writeJson(rw, http.StatusBadRequest, Map{
+			"error":        "Unexpected Content-Type",
+			"content-type": contentType,
+		})
+		return
+	}
+}
 
 func writeJson(rw http.ResponseWriter, code int, data any) (err error) {
 	buf, err := json.Marshal(data)

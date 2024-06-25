@@ -17,7 +17,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package main
+package notify
 
 import (
 	"encoding/json"
@@ -25,7 +25,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -73,7 +75,7 @@ type statHistoryData struct {
 	Months statDataMonths `json:"months"`
 }
 
-type statData struct {
+type StatData struct {
 	Date statTime `json:"date"`
 	statHistoryData
 	Prev  statHistoryData         `json:"prev"`
@@ -82,7 +84,21 @@ type statData struct {
 	Accesses map[string]int `json:"accesses"`
 }
 
-func (d *statData) update(newData *statInstData) {
+func (d *StatData) Clone() *StatData {
+	cloned := new(StatData)
+	*cloned = *d
+	cloned.Years = make(map[string]statInstData, len(d.Years))
+	for k, v := range d.Years {
+		cloned.Years[k] = v
+	}
+	cloned.Accesses = make(map[string]int, len(d.Accesses))
+	for k, v := range d.Accesses {
+		cloned.Accesses[k] = v
+	}
+	return cloned
+}
+
+func (d *StatData) update(newData *statInstData) {
 	now := makeStatTime(time.Now())
 	if d.Date.Year != 0 {
 		switch {
@@ -201,25 +217,41 @@ func (d *statData) update(newData *statInstData) {
 }
 
 type Stats struct {
-	mux sync.RWMutex
-	statData
+	sync.RWMutex
+	StatData
+
+	subStat map[string]*StatData
+
+	hits atomic.Int32
+	bts  atomic.Int64
 }
 
+const statsDirName = "stats"
 const statsFileName = "stat.json"
 
-func (s *Stats) MarshalJSON() ([]byte, error) {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-
-	return json.Marshal(&s.statData)
+func (s *Stats) Clone() *StatData {
+	s.RLock()
+	defer s.RUnlock()
+	return s.StatData.Clone()
 }
 
-func (s *Stats) Load(dir string) (err error) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+func (s *Stats) MarshalJSON() ([]byte, error) {
+	s.RLock()
+	defer s.RUnlock()
 
-	if err = parseFileOrOld(filepath.Join(dir, statsFileName), func(buf []byte) error {
-		return json.Unmarshal(buf, &s.statData)
+	return json.Marshal(&s.StatData)
+}
+
+func (s *Stats) MarshalSubStat(name string) ([]byte, error) {
+	s.RLock()
+	defer s.RUnlock()
+
+	return json.Marshal(s.subStat[name])
+}
+
+func (s *StatData) load(name string) (err error) {
+	if err = parseFileOrOld(name, func(buf []byte) error {
+		return json.Unmarshal(buf, s)
 	}); err != nil {
 		return
 	}
@@ -233,30 +265,88 @@ func (s *Stats) Load(dir string) (err error) {
 	return
 }
 
-// Save
-func (s *Stats) Save(dir string) (err error) {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
+func (s *Stats) Load(dir string) (err error) {
+	s.Lock()
+	defer s.Unlock()
 
-	buf, err := json.Marshal(&s.statData)
-	if err != nil {
+	if err = s.StatData.load(filepath.Join(dir, statsFileName)); err != nil {
 		return
 	}
+	s.subStat = make(map[string]*StatData)
 
-	if err = writeFileWithOld(filepath.Join(dir, statsFileName), buf, 0644); err != nil {
-		return
+	if entries, err := os.ReadDir(filepath.Join(dir, statsDirName)); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if name, ok := strings.CutSuffix(entry.Name(), ".json"); ok {
+				data := new(StatData)
+				if err := data.load(filepath.Join(dir, statsDirName, entry.Name())); err != nil {
+					return err
+				}
+				s.subStat[name] = data
+			}
+		}
 	}
 	return
 }
 
-func (s *Stats) AddHits(hits int32, bytes int64) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+// Save
+func (s *Stats) Save(dir string) (err error) {
+	s.RLock()
+	defer s.RUnlock()
 
-	s.update(&statInstData{
+	var buf []byte
+	if buf, err = json.Marshal(&s.StatData); err != nil {
+		return
+	}
+	if err = writeFileWithOld(filepath.Join(dir, statsFileName), buf, 0644); err != nil {
+		return
+	}
+
+	if err := os.Mkdir(filepath.Join(dir, statsDirName), 0755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	for name, data := range s.subStat {
+		if buf, err = json.Marshal(data); err != nil {
+			return
+		}
+		if err = writeFileWithOld(filepath.Join(dir, statsDirName, name+".json"), buf, 0644); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (s *Stats) GetTmpHits() (hits int32, bts int64) {
+	return s.hits.Load(), s.bts.Load()
+}
+
+func (s *Stats) AddHits(hits int32, bytes int64, name string) {
+	s.hits.Add(hits)
+	s.bts.Add(bytes)
+
+	s.Lock()
+	defer s.Unlock()
+
+	data := &statInstData{
 		Hits:  hits,
 		Bytes: bytes,
-	})
+	}
+	s.update(data)
+	if name != "" {
+		ss := s.subStat[name]
+		if ss == nil {
+			ss = new(StatData)
+			ss.Years = make(map[string]statInstData, 2)
+			ss.Accesses = make(map[string]int, 5)
+			if s.subStat == nil {
+				s.subStat = make(map[string]*StatData)
+			}
+			s.subStat[name] = ss
+		}
+		ss.update(data)
+	}
 }
 
 func parseFileOrOld(path string, parser func(buf []byte) error) error {

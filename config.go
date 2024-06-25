@@ -29,10 +29,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/LiterMC/go-openbmclapi/cache"
+	"github.com/LiterMC/go-openbmclapi/limited"
 	"github.com/LiterMC/go-openbmclapi/log"
 	"github.com/LiterMC/go-openbmclapi/storage"
 	"github.com/LiterMC/go-openbmclapi/utils"
@@ -68,6 +70,20 @@ type ServeLimitConfig struct {
 	Enable     bool `yaml:"enable"`
 	MaxConn    int  `yaml:"max-conn"`
 	UploadRate int  `yaml:"upload-rate"`
+}
+
+type APIRateLimitConfig struct {
+	Anonymous limited.RateLimit `yaml:"anonymous"`
+	Logged    limited.RateLimit `yaml:"logged"`
+}
+
+type NotificationConfig struct {
+	EnableEmail         bool   `yaml:"enable-email"`
+	EmailSMTP           string `yaml:"email-smtp"`
+	EmailSMTPEncryption string `yaml:"email-smtp-encryption"`
+	EmailSender         string `yaml:"email-sender"`
+	EmailSenderPassword string `yaml:"email-sender-password"`
+	EnableWebhook       bool   `yaml:"enable-webhook"`
 }
 
 type DatabaseConfig struct {
@@ -118,6 +134,11 @@ func (c *CacheConfig) UnmarshalYAML(n *yaml.Node) (err error) {
 	return nil
 }
 
+type GithubAPIConfig struct {
+	UpdateCheckInterval utils.YAMLDuration `yaml:"update-check-interval"`
+	Authorization       string             `yaml:"authorization"`
+}
+
 type DashboardConfig struct {
 	Enable       bool   `yaml:"enable"`
 	Username     string `yaml:"username"`
@@ -125,6 +146,8 @@ type DashboardConfig struct {
 	PwaName      string `yaml:"pwa-name"`
 	PwaShortName string `yaml:"pwa-short_name"`
 	PwaDesc      string `yaml:"pwa-description"`
+
+	NotifySubject string `yaml:"notification-subject"`
 }
 
 type TunnelConfig struct {
@@ -181,7 +204,10 @@ type Config struct {
 	Tunneler     TunnelConfig                   `yaml:"tunneler"`
 	Cache        CacheConfig                    `yaml:"cache"`
 	ServeLimit   ServeLimitConfig               `yaml:"serve-limit"`
+	RateLimit    APIRateLimitConfig             `yaml:"api-rate-limit"`
+	Notification NotificationConfig             `yaml:"notification"`
 	Dashboard    DashboardConfig                `yaml:"dashboard"`
+	GithubAPI    GithubAPIConfig                `yaml:"github-api"`
 	Database     DatabaseConfig                 `yaml:"database"`
 	Hijack       HijackConfig                   `yaml:"hijack"`
 	Storages     []storage.StorageOption        `yaml:"storages"`
@@ -223,7 +249,7 @@ var defaultConfig = Config{
 	Tunneler: TunnelConfig{
 		Enable:        false,
 		TunnelProg:    "./path/to/tunnel/program",
-		OutputRegex:   `\bNATedAddr\s+(?<host>[0-9.]+|\[[0-9a-f:]+\]):(?<port>\d+)$`,
+		OutputRegex:   `\bNATedAddr\s+(?P<host>[0-9.]+|\[[0-9a-f:]+\]):(?P<port>\d+)$`,
 		TunnelTimeout: 0,
 	},
 
@@ -238,11 +264,36 @@ var defaultConfig = Config{
 		UploadRate: 1024 * 12, // 12MB
 	},
 
+	RateLimit: APIRateLimitConfig{
+		Anonymous: limited.RateLimit{
+			PerMin:  10,
+			PerHour: 120,
+		},
+		Logged: limited.RateLimit{
+			PerMin:  120,
+			PerHour: 6000,
+		},
+	},
+
+	Notification: NotificationConfig{
+		EnableEmail:         false,
+		EmailSMTP:           "smtp.example.com:25",
+		EmailSMTPEncryption: "tls",
+		EmailSender:         "noreply@example.com",
+		EmailSenderPassword: "example-password",
+		EnableWebhook:       true,
+	},
+
 	Dashboard: DashboardConfig{
-		Enable:       true,
-		PwaName:      "GoOpenBmclApi Dashboard",
-		PwaShortName: "GOBA Dash",
-		PwaDesc:      "Go-Openbmclapi Internal Dashboard",
+		Enable:        true,
+		PwaName:       "GoOpenBmclApi Dashboard",
+		PwaShortName:  "GOBA Dash",
+		PwaDesc:       "Go-Openbmclapi Internal Dashboard",
+		NotifySubject: "mailto:user@example.com",
+	},
+
+	GithubAPI: GithubAPIConfig{
+		UpdateCheckInterval: (utils.YAMLDuration)(time.Hour),
 	},
 
 	Database: DatabaseConfig{

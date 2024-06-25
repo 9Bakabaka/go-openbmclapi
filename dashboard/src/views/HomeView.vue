@@ -3,17 +3,26 @@ import { onMounted, ref, computed, watch, inject, type Ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useRequest } from 'vue-request'
 import Button from 'primevue/button'
-import Chart from 'primevue/chart'
+import InputSwitch from 'primevue/inputswitch'
+import Message from 'primevue/message'
 import ProgressSpinner from 'primevue/progressspinner'
 import Skeleton from 'primevue/skeleton'
-import Message from 'primevue/message'
-import InputSwitch from 'primevue/inputswitch'
+import TabMenu from 'primevue/tabmenu'
 import { useToast } from 'primevue/usetoast'
-import { formatNumber, formatBytes, formatTime } from '@/utils'
-import HitsChart from '@/components/HitsChart.vue'
+import { formatTime } from '@/utils'
+import HitsCharts from '@/components/HitsCharts.vue'
 import UAChart from '@/components/UAChart.vue'
 import LogBlock from '@/components/LogBlock.vue'
-import { getStatus, getPprofURL, type StatInstData, type PprofLookups } from '@/api/v0'
+import StatusButton from '@/components/StatusButton.vue'
+import {
+	getStatus,
+	getStat,
+	getPprofURL,
+	EMPTY_STAT,
+	type Stats,
+	type StatusRes,
+	type PprofLookups,
+} from '@/api/v0'
 import { LogIO, type LogMsg } from '@/api/log.io'
 import { bindRefToLocalStorage } from '@/cookies'
 import { tr } from '@/lang'
@@ -31,11 +40,12 @@ setInterval(() => {
 	now.value = new Date()
 }, 1000)
 
-const { data, error, loading } = useRequest(getStatus, {
+const { data, error, loading } = useRequest((): Promise<StatusRes> => getStatus(token.value), {
 	pollingInterval: 10000,
 	loadingDelay: 500,
 	loadingKeep: 2000,
 })
+error.value = new Error('Loading ...')
 
 var requestingLogIO = false
 var logIO: LogIO | null = null
@@ -53,70 +63,71 @@ const status = computed(() =>
 	error.value ? 'error' : data.value && data.value.enabled ? 'enabled' : 'disabled',
 )
 
-const stat = computed(() => {
+const OVERALL_ID = ':Overall:'
+const avaliableStorages = computed(() => {
+	const s = [{ label: OVERALL_ID }]
+	if (data.value) {
+		for (const storage of data.value.storages) {
+			s.push({ label: storage })
+		}
+	}
+	return s
+})
+const activeStorageIndex = ref(0)
+const activeStats = ref<Stats | null>(null)
+
+watch(activeStorageIndex, async (newIndex) => {
 	if (!data.value) {
+		activeStats.value = null
 		return
 	}
-	const stat = data.value.stats
-	stat.days = cutDays(stat.days, stat.date.year, stat.date.month)
-	stat.prev.days = cutDays(stat.prev.days, stat.date.year, stat.date.month - 1)
-
-	stat.days[stat.date.day] = stat.hours.reduce((sum, v) => ({
-		hits: sum.hits + v.hits,
-		bytes: sum.bytes + v.bytes,
-	}))
-	stat.months[stat.date.month] = stat.days.reduce((sum, v) => ({
-		hits: sum.hits + v.hits,
-		bytes: sum.bytes + v.bytes,
-	}))
-	stat.years[stat.date.year.toString()] = stat.months.reduce((sum, v) => ({
-		hits: sum.hits + v.hits,
-		bytes: sum.bytes + v.bytes,
-	}))
-	return stat
+	if (!newIndex) {
+		activeStats.value = data.value.stats
+		return
+	}
+	const storageId = data.value.storages[newIndex - 1]
+	if (!storageId) {
+		activeStorageIndex.value = 0
+		activeStats.value = null
+		return
+	}
+	const statClearTimerId = setTimeout(() => {
+		activeStats.value = null
+	}, 500)
+	const res = await getStat(storageId, token.value)
+	clearTimeout(statClearTimerId)
+	if (res === null) {
+		activeStats.value = JSON.parse(JSON.stringify(EMPTY_STAT))
+		return
+	}
+	activeStats.value = res
+	return
 })
 
-function formatHour(hour: number): string {
-	const offset = -new Date().getTimezoneOffset()
-	let min = hour * 60 + offset
-	hour = Math.floor(min / 60) % 24
-	min %= 60
-	if (hour < 0) {
-		hour += 24
+watch(data, async (data) => {
+	if (!data) {
+		activeStats.value = null
+		return
 	}
-	if (min < 0) {
-		min += 60
+	const newIndex = activeStorageIndex.value
+	if (!newIndex) {
+		activeStats.value = data.stats
+		return
 	}
-	return `${hour}:${min.toString().padStart(2, '0')}`
-}
-
-function cutDays(days: StatInstData[], year: number, month: number): StatInstData[] {
-	const dayCount = new Date(year, month, 0).getDate()
-	days.length = dayCount
-	return days
-}
-
-function formatDay(day: number): string {
-	if (!stat.value) {
-		return ''
+	const storageId = data.storages[newIndex - 1]
+	if (!storageId) {
+		activeStorageIndex.value = 0
+		activeStats.value = null
+		return
 	}
-	const date = new Date(Date.UTC(stat.value.date.year, stat.value.date.month, day))
-	return `${date.getMonth() + 1}-${date.getDate()}`
-}
-
-function formatMonth(month: number): string {
-	if (!stat.value) {
-		return ''
+	const res = await getStat(storageId, token.value)
+	if (res === null) {
+		activeStats.value = JSON.parse(JSON.stringify(EMPTY_STAT))
+		return
 	}
-	const date = new Date(Date.UTC(stat.value.date.year, month + 1, 1))
-	return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}`
-}
-
-function getDaysInMonth(): number {
-	const date = new Date()
-	const days = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate()
-	return date.getDate() / days
-}
+	activeStats.value = res
+	return
+})
 
 async function requestPprof(lookup: PprofLookups, view?: boolean): Promise<void> {
 	if (!token.value || requestingPprof.value) {
@@ -225,23 +236,20 @@ onMounted(() => {
 		<div class="main">
 			<div class="flex-row-center basic-info">
 				<div class="flex-row-center" style="height: 4rem">
-					<Button class="info-status" :status="status">
-						{{ tr(`badge.server.status.${status}`) }}
-					</Button>
-
+					<StatusButton :status="status" />
 					<ProgressSpinner v-if="loading" class="polling" strokeWidth="6" />
 				</div>
 				<div v-if="error">
 					<b>{{ error }}</b>
 				</div>
 				<template v-else-if="data">
-					<div class="no-select">
+					<div class="select-none">
 						<span>{{ tr('message.server.run-for') }}&nbsp;</span>
 						<span class="info-uptime">
 							{{ formatTime(now.getTime() - new Date(data.startAt).getTime()) }}
 						</span>
 					</div>
-					<div v-if="data.isSync" class="no-select">
+					<div v-if="data.isSync" class="select-none">
 						&nbsp; |
 						{{ tr('message.server.synchronizing') }}
 						&nbsp;
@@ -255,54 +263,20 @@ onMounted(() => {
 					</div>
 				</template>
 			</div>
-			<div class="hits-chart-box">
-				<div class="chart-card">
-					<h3>{{ tr('title.day') }}</h3>
-					<HitsChart
-						v-if="stat"
-						class="hits-chart"
-						:max="25"
-						:offset="23"
-						:data="stat.hours"
-						:oldData="stat.prev.hours"
-						:current="stat.date.hour + new Date().getMinutes() / 60"
-						:formatXLabel="formatHour"
-					/>
-					<Skeleton v-else width="" height="" class="hits-chart" />
-				</div>
-				<div class="chart-card">
-					<h3>{{ tr('title.month') }}</h3>
-					<HitsChart
-						v-if="stat"
-						class="hits-chart"
-						:max="31"
-						:offset="29"
-						:data="stat.days"
-						:oldData="stat.prev.days"
-						:current="stat.date.day + new Date().getUTCHours() / 24"
-						:formatXLabel="formatDay"
-					/>
-					<Skeleton v-else width="" height="" class="hits-chart" />
-				</div>
-				<div class="chart-card">
-					<h3>{{ tr('title.year') }}</h3>
-					<HitsChart
-						v-if="stat"
-						class="hits-chart"
-						:max="13"
-						:offset="11"
-						:data="stat.months"
-						:oldData="stat.prev.months"
-						:current="stat.date.month + getDaysInMonth()"
-						:formatXLabel="formatMonth"
-					/>
-					<Skeleton v-else width="" height="" class="hits-chart" />
-				</div>
-				<!-- TODO: show yearly chart -->
+			<div class="charts-tab">
+				<TabMenu
+					style="
+						border-top-left-radius: var(--border-radius);
+						border-top-right-radius: var(--border-radius);
+					"
+					:model="avaliableStorages"
+					v-model:activeIndex="activeStorageIndex"
+				/>
+				<HitsCharts class="charts-tab-charts" :stats="activeStats" />
 			</div>
 			<div class="info-chart-box">
 				<h3>{{ tr('title.user_agents') }}</h3>
-				<UAChart v-if="stat" class="ua-chart" :max="5" :data="stat.accesses" />
+				<UAChart v-if="data && data.stats" class="ua-chart" :max="5" :data="data.stats.accesses" />
 				<Skeleton v-else width="" height="" class="ua-chart" />
 			</div>
 		</div>
@@ -342,7 +316,7 @@ onMounted(() => {
 				</nav>
 				<div class="flex-row-center log-options">
 					<div class="flex-row-center">
-						<span class="no-select">{{ tr('message.log.option.debug') }}&nbsp;</span>
+						<span class="select-none">{{ tr('message.log.option.debug') }}&nbsp;</span>
 						<InputSwitch v-model="logDebugLevel" />
 					</div>
 				</div>
@@ -377,65 +351,8 @@ onMounted(() => {
 	font-weight: 200;
 }
 
-.hits-chart-box {
-	grid-area: b;
-}
-
 .info-chart-box {
 	grid-area: c;
-}
-
-.info-status {
-	--flash-from: unset;
-	--flash-out: var(--flash-from);
-	display: inline-flex !important;
-	flex-direction: row;
-	align-items: center;
-	width: 10rem;
-	height: 2.7rem;
-	padding: 0.5rem;
-	margin: 0.5rem;
-	border: none;
-	border-radius: 0.2rem;
-	font-weight: 800;
-	user-select: none;
-	cursor: pointer;
-	transition: 1s background-color ease-out;
-}
-
-.info-status[status='enabled'] {
-	--flash-from: #fff;
-	--flash-to: #11dfc3;
-	color: #fff;
-	background-color: #28a745;
-	animation: flash 1s infinite;
-}
-
-.info-status[status='disabled'] {
-	--flash-from: #fff;
-	--flash-to: #e61a05;
-	color: #fff;
-	background-color: #f89f1b;
-	animation: flash 3s infinite;
-}
-
-.info-status[status='error'] {
-	--flash-from: #8a8dac;
-	color: #fff;
-	background-color: #bfadad;
-}
-
-.info-status::before {
-	content: ' ';
-	display: inline-block;
-	width: 1.05rem;
-	height: 1.05rem;
-	margin-right: 0.5rem;
-	border: solid #fff 0.25rem;
-	border-radius: 50%;
-	background-color: var(--flash-out);
-	box-shadow: #fff8 inset 0 0 2px;
-	transition: background-color 0.15s;
 }
 
 .polling {
@@ -448,15 +365,14 @@ onMounted(() => {
 	font-style: italic;
 }
 
-.chart-card {
-	margin-bottom: 1rem;
+.charts-tab {
+	border: 1px solid var(--surface-border);
+	border-radius: var(--border-radius);
 }
 
-.hits-chart {
-	max-width: 100%;
-	width: 45rem;
-	height: 13rem;
-	user-select: none;
+.charts-tab-charts {
+	margin: 0.5rem;
+	margin-top: 0;
 }
 
 .ua-chart {
@@ -501,7 +417,12 @@ onMounted(() => {
 		height: unset;
 	}
 
-	.hits-chart,
+	.charts-tab {
+		position: relative;
+		left: -1.5rem;
+		width: calc(100% + 3rem);
+	}
+
 	.ua-chart {
 		width: 100%;
 	}

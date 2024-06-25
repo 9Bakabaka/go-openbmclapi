@@ -1,6 +1,10 @@
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default VitePWA({
+	devOptions: {
+		enabled: true,
+		type: 'module',
+	},
 	srcDir: 'src',
 	filename: 'sw.ts',
 	registerType: 'autoUpdate',
@@ -33,6 +37,11 @@ export default VitePWA({
 				sizes: '512x512',
 				type: 'image/png',
 				purpose: 'maskable',
+			},
+			{
+				src: 'logo.png',
+				sizes: '512x512',
+				type: 'image/png',
 			},
 		],
 	},

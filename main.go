@@ -36,11 +36,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"runtime/pprof"
 
+	doh "github.com/libp2p/go-doh-resolver"
+
+	"github.com/LiterMC/go-openbmclapi/database"
 	"github.com/LiterMC/go-openbmclapi/internal/build"
 	"github.com/LiterMC/go-openbmclapi/lang"
 	"github.com/LiterMC/go-openbmclapi/limited"
@@ -111,7 +115,7 @@ func main() {
 		lang.SetLang("en-us")
 	}
 	lang.ParseSystemLanguage()
-	log.Info("language:", lang.GetLang().Code())
+	log.Debug("language:", lang.GetLang().Code())
 
 	printShortLicense()
 	parseArgs()
@@ -142,19 +146,6 @@ func main() {
 	log.StartFlushLogFile()
 
 	r := new(Runner)
-	signalCh := make(chan os.Signal, 1)
-
-	if config.Advanced.DebugLog {
-		var err error
-		dumpCmdFile := filepath.Join(os.TempDir(), fmt.Sprintf("go-openbmclapi-dump-command.%d.in", os.Getpid()))
-		if r.dumpCmdFd, err = os.OpenFile(dumpCmdFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0660); err != nil {
-			log.Errorf("Cannot create %q: %v", dumpCmdFile, err)
-		} else {
-			defer os.Remove(dumpCmdFile)
-			defer r.dumpCmdFd.Close()
-			log.Infof("Dump command file %s has created", dumpCmdFile)
-		}
-	}
 
 START:
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,23 +173,20 @@ START:
 
 	r.InitCluster(ctx)
 
-	if !r.cluster.Connect(ctx) {
-		osExit(CodeClientOrServerError)
-	}
-
-	log.Debugf("Receiving signals")
-	signal.Notify(signalCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
-	firstSyncDone := make(chan struct{}, 0)
-
 	go func(ctx context.Context) {
 		defer log.RecordPanic()
-		defer close(firstSyncDone)
-		r.InitSynchronizer(ctx)
-	}(ctx)
 
-	go func(ctx context.Context) {
-		defer log.RecordPanic()
+		if !r.cluster.Connect(ctx) {
+			osExit(CodeClientOrServerError)
+		}
+
+		firstSyncDone := make(chan struct{}, 0)
+		go func() {
+			defer log.RecordPanic()
+			defer close(firstSyncDone)
+			r.InitSynchronizer(ctx)
+		}()
+
 		listener := r.CreateHTTPServerListener(ctx)
 		go func(listener net.Listener) {
 			defer listener.Close()
@@ -235,8 +223,7 @@ START:
 		r.EnableCluster(ctx)
 	}(ctx)
 
-	code := r.DoSignals(signalCh, cancel)
-	signal.Stop(signalCh)
+	code := r.DoSignals(cancel)
 	if r.restartFlag {
 		goto START
 	}
@@ -246,13 +233,14 @@ START:
 type Runner struct {
 	restartFlag bool
 
-	dumpCmdFd  *os.File
 	cluster    *Cluster
 	clusterSvr *http.Server
 
 	tlsConfig   *tls.Config
 	listener    net.Listener
 	publicHosts []string
+
+	updating atomic.Bool
 }
 
 func (r *Runner) getPublicPort() uint16 {
@@ -269,7 +257,12 @@ func (r *Runner) getCertCount() int {
 	return len(r.tlsConfig.Certificates)
 }
 
-func (r *Runner) DoSignals(signalCh <-chan os.Signal, cancel context.CancelFunc) int {
+func (r *Runner) DoSignals(cancel context.CancelFunc) int {
+	signalCh := make(chan os.Signal, 1)
+	log.Debugf("Receiving signals")
+	signal.Notify(signalCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer signal.Stop(signalCh)
+
 	r.restartFlag = false
 	for {
 		select {
@@ -279,23 +272,30 @@ func (r *Runner) DoSignals(signalCh <-chan os.Signal, cancel context.CancelFunc)
 			if s == syscall.SIGQUIT {
 				// avaliable commands see <https://pkg.go.dev/runtime/pprof#Profile>
 				dumpCommand := "heap"
-				if r.dumpCmdFd != nil {
-					var buf [256]byte
-					if _, err := r.dumpCmdFd.Seek(0, io.SeekStart); err != nil {
-						log.Errorf("Cannot read dump command file: %v", err)
-					} else if n, err := r.dumpCmdFd.Read(buf[:]); err != nil {
-						log.Errorf("Cannot read dump command file: %v", err)
-					} else {
-						dumpCommand = (string)(bytes.TrimSpace(buf[:n]))
-					}
-					r.dumpCmdFd.Truncate(0)
+				dumpFileName := filepath.Join(os.TempDir(), fmt.Sprintf("go-openbmclapi-dump-command.%d.in", os.Getpid()))
+				log.Infof("Reading dump command file at %q", dumpFileName)
+				var buf [128]byte
+				if dumpFile, err := os.Open(dumpFileName); err != nil {
+					log.Errorf("Cannot open dump command file: %v", err)
+				} else if n, err := dumpFile.Read(buf[:]); err != nil {
+					dumpFile.Close()
+					log.Errorf("Cannot read dump command file: %v", err)
+				} else {
+					dumpFile.Truncate(0)
+					dumpFile.Close()
+					dumpCommand = (string)(bytes.TrimSpace(buf[:n]))
+				}
+				pcmd := pprof.Lookup(dumpCommand)
+				if pcmd == nil {
+					log.Errorf("No pprof command is named %q", dumpCommand)
+					continue
 				}
 				name := fmt.Sprintf(time.Now().Format("dump-%s-20060102-150405.txt"), dumpCommand)
 				log.Infof("Creating goroutine dump file at %s", name)
 				if fd, err := os.Create(name); err != nil {
 					log.Infof("Cannot create dump file: %v", err)
 				} else {
-					err := pprof.Lookup(dumpCommand).WriteTo(fd, 1)
+					err := pcmd.WriteTo(fd, 1)
 					fd.Close()
 					if err != nil {
 						log.Infof("Cannot write dump file: %v", err)
@@ -307,7 +307,7 @@ func (r *Runner) DoSignals(signalCh <-chan os.Signal, cancel context.CancelFunc)
 			}
 
 			cancel()
-			shutCtx, cancelShut := context.WithTimeout(context.Background(), time.Minute)
+			shutCtx, cancelShut := context.WithTimeout(context.Background(), time.Second*15)
 			log.Warn(Tr("warn.server.closing"))
 			shutExit := make(chan struct{}, 0)
 			go func() {
@@ -341,6 +341,8 @@ func (r *Runner) InitCluster(ctx context.Context) {
 		cache  = config.Cache.newCache()
 	)
 
+	_ = doh.NewResolver // TODO: use doh resolver
+
 	r.cluster = NewCluster(ctx,
 		ClusterServerURL,
 		baseDir,
@@ -364,9 +366,41 @@ func (r *Runner) InitCluster(ctx context.Context) {
 	}
 }
 
+func (r *Runner) UpdateFileRecords(files []FileInfo, oldfileset map[string]int64) {
+	if !config.Hijack.Enable {
+		return
+	}
+	if !r.updating.CompareAndSwap(false, true) {
+		return
+	}
+	defer r.updating.Store(false)
+
+	sem := limited.NewSemaphore(12)
+	log.Info("Begin to update file records")
+	for _, f := range files {
+		if strings.HasPrefix(f.Path, "/openbmclapi/download/") {
+			continue
+		}
+		if oldfileset[f.Hash] > 0 {
+			continue
+		}
+		sem.Acquire()
+		go func(rec database.FileRecord) {
+			defer sem.Release()
+			r.cluster.database.SetFileRecord(rec)
+		}(database.FileRecord{
+			Path: f.Path,
+			Hash: f.Hash,
+			Size: f.Size,
+		})
+	}
+	sem.Wait()
+	log.Info("All file records are updated")
+}
+
 func (r *Runner) InitSynchronizer(ctx context.Context) {
 	log.Info(Tr("info.filelist.fetching"))
-	fl, err := r.cluster.GetFileList(ctx)
+	fl, err := r.cluster.GetFileList(ctx, 0)
 	if err != nil {
 		log.Errorf(Tr("error.filelist.fetch.failed"), err)
 		if errors.Is(err, context.Canceled) {
@@ -385,10 +419,10 @@ func (r *Runner) InitSynchronizer(ctx context.Context) {
 	}
 
 	if !config.Advanced.SkipFirstSync {
-		r.cluster.SyncFiles(ctx, fl, false)
-		if ctx.Err() != nil {
+		if !r.cluster.SyncFiles(ctx, fl, false) {
 			return
 		}
+		go r.UpdateFileRecords(fl, nil)
 
 		if !config.Advanced.NoGC {
 			go r.cluster.Gc()
@@ -398,17 +432,38 @@ func (r *Runner) InitSynchronizer(ctx context.Context) {
 			return
 		}
 	}
+
+	var lastMod int64
+	for _, f := range fl {
+		if f.Mtime > lastMod {
+			lastMod = f.Mtime
+		}
+	}
+
 	createInterval(ctx, func() {
-		log.Info(Tr("info.fetch.filelist"))
-		fl, err := r.cluster.GetFileList(ctx)
+		log.Info(Tr("info.filelist.fetching"))
+		fl, err := r.cluster.GetFileList(ctx, lastMod)
 		if err != nil {
-			log.Errorf(Tr("error.cannot.fetch.filelist"), err)
+			log.Errorf(Tr("error.filelist.fetch.failed"), err)
 			return
 		}
+		if len(fl) == 0 {
+			log.Infof("No file was updated since %s", time.UnixMilli(lastMod).Format(time.DateTime))
+			return
+		}
+		for _, f := range fl {
+			if f.Mtime > lastMod {
+				lastMod = f.Mtime
+			}
+		}
+
 		checkCount = (checkCount + 1) % heavyCheckInterval
-		r.cluster.SyncFiles(ctx, fl, heavyCheck && checkCount == 0)
-		if !config.Advanced.NoGC && !config.OnlyGcWhenStart {
-			go r.cluster.Gc()
+		oldfileset := r.cluster.CloneFileset()
+		if r.cluster.SyncFiles(ctx, fl, heavyCheck && checkCount == 0) {
+			go r.UpdateFileRecords(fl, oldfileset)
+			if !config.Advanced.NoGC && !config.OnlyGcWhenStart {
+				go r.cluster.Gc()
+			}
 		}
 	}, (time.Duration)(config.SyncInterval)*time.Minute)
 }
@@ -576,7 +631,10 @@ func (r *Runner) enableClusterByTunnel(ctx context.Context) {
 			select {
 			case addr := <-detectedCh:
 				log.Infof(Tr("info.tunnel.detected"), addr.host, addr.port)
-				r.cluster.host, r.cluster.publicPort = addr.host, addr.port
+				r.cluster.publicPort = addr.port
+				if !r.cluster.byoc {
+					r.cluster.host = addr.host
+				}
 				strPort := strconv.Itoa((int)(r.getPublicPort()))
 				if spp, ok := r.listener.(interface{ SetPublicPort(port string) }); ok {
 					spp.SetPublicPort(strPort)

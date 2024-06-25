@@ -24,14 +24,46 @@
 		},
 
 		"settings": "设置",
+		"create-new": "创建新的",
+		"edit": "修改",
+		"operation": "操作",
+
+		"i18n": "国际化",
+		"language": "语言",
+
+		"debugs_and_logs": "调试 & 日志",
+		"logs": "日志",
 
 		"notification": "推送",
 		"notify": {
 			"when.disabled": "下线时发送通知",
 			"when.enabled": "上线时发送通知",
 			"when.sync.done": "同步完成时发送通知",
-			"when.update.available": "有更新时发送通知"
+			"when.update.available": "有更新时发送通知",
+			"report": {
+				"daily": "报告每日请求",
+				"at": "报告时间"
+			},
+			"advanced": "高级选项"
+		},
+
+		"emails": "邮件",
+		"email": {
+			"recver": "收件人"
+		},
+
+		"webhooks": "网络钩子",
+		"webhook": {
+			"name": "名称",
+			"endpoint": "端点",
+			"scopes": "域",
+			"auth-header": "授权标头",
+			"configure": "配置网络钩子"
 		}
+	},
+	"button": {
+		"enable": "启用",
+		"disable": "禁用"
 	},
 	"message": {
 		"server": {
@@ -51,9 +83,20 @@
 			"login-to-view": "后查看日志"
 		},
 		"settings": {
+			"login": {
+				"auth": "需要授权",
+				"first": "使用此功能前请先登录"
+			},
 			"notify": {
+				"cant.enable": "无法启用通知",
+				"denied": "通知已被浏览器拒绝"
+			},
+			"webpush": {
 				"cant.enable": "无法启用推送",
 				"denied": "推送已被浏览器拒绝"
+			},
+			"filelist": {
+				"cant.fetch": "无法获取文件列表"
 			}
 		}
 	},

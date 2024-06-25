@@ -6,7 +6,7 @@ import Button from 'primevue/button'
 import Dropdown from 'primevue/dropdown'
 import Toast from 'primevue/toast'
 import { useToast } from 'primevue/usetoast'
-import { type Lang, avaliableLangs, getLang, setLang, tr } from '@/lang'
+import { type Lang, avaliableLangs, getLang, setLang, tr, langNameMap } from '@/lang'
 
 const toast = useToast()
 const token = inject('token') as Ref<string | null>
@@ -29,18 +29,13 @@ async function logout(): Promise<void> {
 
 const languages = avaliableLangs.map((v) => v.code)
 const selectedLang = computed({
-	get() {
+	get(): Lang {
 		return getLang()
 	},
-	set(value) {
+	set(value: Lang) {
 		setLang(value)
 	},
 })
-
-const langNameMap: { [key: string]: string } = {
-	'en-US': 'English',
-	'zh-CN': '简体中文',
-}
 </script>
 
 <template>
@@ -49,11 +44,11 @@ const langNameMap: { [key: string]: string } = {
 			<img class="header-logo" src="/logo.png" />
 		</RouterLink>
 
-		<div v-if="token" class="flex-row-center no-select nav-login pointer" @click="logout">
+		<div v-if="token" class="flex-row-center select-none nav-login pointer" @click="logout">
 			<span>{{ tr('title.logout') }}&nbsp;</span>
 			<i class="pi pi-sign-out"></i>
 		</div>
-		<RouterLink v-else class="flex-row-center no-select nav-login" to="/login">
+		<RouterLink v-else class="flex-row-center select-none nav-login" to="/login">
 			<span>{{ tr('title.login') }}&nbsp;</span>
 			<i class="pi pi-sign-in"></i>
 		</RouterLink>
@@ -76,6 +71,12 @@ const langNameMap: { [key: string]: string } = {
 				</template>
 			</Dropdown>
 		</div>
+		<RouterLink class="flex-row-center button-link" to="/">
+			<Button icon="pi pi-home" aria-label="Home" />
+		</RouterLink>
+		<RouterLink class="flex-row-center button-link" to="/settings">
+			<Button icon="pi pi-cog" aria-label="Settings" severity="secondary" />
+		</RouterLink>
 		<a
 			class="nav-github"
 			target="_blank"
@@ -106,16 +107,15 @@ const langNameMap: { [key: string]: string } = {
 
 <style scoped>
 #header {
-	position: fixed;
+	position: sticky;
 	top: 0;
-	left: 0;
-	z-index: 999999;
+	z-index: 1000;
 	justify-content: flex-end;
 	width: 100vw;
 	height: 4rem;
 	padding-left: 2rem;
 	padding-right: 1rem;
-	background-color: color-mix(in srgb, var(--primary-50), transparent);
+	background-color: color-mix(in srgb, var(--primary-50) 30%, transparent);
 	box-shadow: #0008 0 0 1rem -0.5rem;
 	backdrop-filter: blur(0.4rem);
 }
@@ -147,6 +147,18 @@ const langNameMap: { [key: string]: string } = {
 	font-size: 0.9rem;
 }
 
+.button-link {
+	width: 2.2rem;
+	height: 2.2rem;
+	margin-right: 0.5rem !important;
+	text-decoration: none;
+}
+
+.button-link > button {
+	width: 100%;
+	height: 100%;
+}
+
 .nav-github {
 	display: flex;
 	flex-direction: row;
@@ -175,7 +187,7 @@ const langNameMap: { [key: string]: string } = {
 }
 
 #body {
-	padding: 5rem 2rem 4rem 2rem;
+	padding: 1rem 2rem 4rem 2rem;
 	min-height: 100vh;
 }
 
@@ -202,6 +214,12 @@ const langNameMap: { [key: string]: string } = {
 	text-decoration: underline;
 }
 
+@media (prefers-color-scheme: dark) {
+	#header {
+		background-color: color-mix(in srgb, var(--primary-50) 10%, transparent);
+	}
+}
+
 @media (max-width: 60rem) {
 	#header {
 		padding: 0;
@@ -215,8 +233,8 @@ const langNameMap: { [key: string]: string } = {
 		left: 1rem;
 	}
 
-	.lang-selector-label {
-		font-size: 0.8rem;
+	.lang-selector-box {
+		display: none;
 	}
 }
 </style>

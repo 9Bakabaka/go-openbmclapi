@@ -24,12 +24,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/studio-b12/gowebdav"
@@ -44,12 +47,12 @@ import (
 )
 
 type WebDavStorageOption struct {
-	MaxConn           int          `yaml:"max-conn"`
-	MaxUploadRate     int          `yaml:"max-upload-rate"`
-	MaxDownloadRate   int          `yaml:"max-download-rate"`
-	PreGenMeasures    bool         `yaml:"pre-gen-measures"`
-	FollowRedirect    bool         `yaml:"follow-redirect"`
-	RedirectLinkCache YAMLDuration `yaml:"redirect-link-cache"`
+	MaxConn           int                `yaml:"max-conn"`
+	MaxUploadRate     int                `yaml:"max-upload-rate"`
+	MaxDownloadRate   int                `yaml:"max-download-rate"`
+	PreGenMeasures    bool               `yaml:"pre-gen-measures"`
+	FollowRedirect    bool               `yaml:"follow-redirect"`
+	RedirectLinkCache utils.YAMLDuration `yaml:"redirect-link-cache"`
 
 	Alias      string `yaml:"alias,omitempty"`
 	WebDavUser `yaml:",inline,omitempty"`
@@ -125,6 +128,11 @@ type WebDavStorage struct {
 	limitedDialer *limited.LimitedDialer
 	httpCli       *http.Client
 	noRedCli      *http.Client // no redirect client
+
+	measures  *utils.SyncMap[int, struct{}]
+	working   atomic.Int32
+	checkMux  sync.RWMutex
+	lastCheck time.Time
 }
 
 var _ Storage = (*WebDavStorage)(nil)
@@ -188,6 +196,7 @@ func (s *WebDavStorage) Init(ctx context.Context) (err error) {
 		return
 	}
 
+	s.measures = utils.NewSyncMap[int, struct{}]()
 	if err := s.cli.Mkdir("measure", 0755); err != nil {
 		if !webdavIsHTTPError(err, http.StatusConflict) {
 			log.Warnf("Cannot create measure folder for %s: %v", s.String(), err)
@@ -202,10 +211,15 @@ func (s *WebDavStorage) Init(ctx context.Context) (err error) {
 		}
 		log.Info("Measure files created")
 	}
+	s.working.Store(1)
 	return
 }
 
 func (s *WebDavStorage) putFile(path string, r io.ReadSeeker) error {
+	return s.putFileWithClient(s.httpCli, path, r)
+}
+
+func (s *WebDavStorage) putFileWithClient(cli *http.Client, path string, r io.ReadSeeker) error {
 	size, err := utils.GetReaderRemainSize(r)
 	if err != nil {
 		return err
@@ -221,9 +235,10 @@ func (s *WebDavStorage) putFile(path string, r io.ReadSeeker) error {
 		return err
 	}
 	req.SetBasicAuth(s.opt.GetUsername(), s.opt.GetPassword())
+	req.Header.Set("User-Agent", build.ClusterUserAgentFull)
 	req.ContentLength = size
 
-	res, err := s.httpCli.Do(req)
+	res, err := cli.Do(req)
 	if err != nil {
 		return err
 	}
@@ -232,7 +247,7 @@ func (s *WebDavStorage) putFile(path string, r io.ReadSeeker) error {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
 		return nil
 	default:
-		return &utils.HTTPStatusError{Code: res.StatusCode}
+		return utils.NewHTTPStatusErrorFromResponse(res)
 	}
 }
 
@@ -265,25 +280,44 @@ func (s *WebDavStorage) Remove(hash string) error {
 }
 
 func (s *WebDavStorage) WalkDir(walker func(hash string, size int64) error) error {
-	s.limitedDialer.Acquire()
-	defer s.limitedDialer.Release()
-
+	done := make(chan struct{}, len(utils.Hex256))
+	fileCh := make(chan fs.FileInfo, 0)
 	for _, dir := range utils.Hex256 {
-		files, err := s.cli.ReadDir(path.Join("download", dir))
-		if err != nil {
-			continue
-		}
-		for _, f := range files {
-			if !f.IsDir() {
-				if hash := f.Name(); len(hash) >= 2 && hash[:2] == dir {
-					if err := walker(hash, f.Size()); err != nil {
-						return err
+		done <- struct{}{}
+		go func(dir string) {
+			s.limitedDialer.Acquire()
+			defer s.limitedDialer.Release()
+			defer func() {
+				<-done
+			}()
+
+			files, err := s.cli.ReadDir(path.Join("download", dir))
+			if err != nil {
+				return
+			}
+			for _, f := range files {
+				if !f.IsDir() {
+					if hash := f.Name(); len(hash) >= 2 && hash[:2] == dir {
+						fileCh <- f
 					}
 				}
 			}
+		}(dir)
+	}
+	count := len(utils.Hex256)
+	for {
+		select {
+		case done <- struct{}{}:
+			count--
+			if count <= 0 {
+				return nil
+			}
+		case f := <-fileCh:
+			if err := walker(f.Name(), f.Size()); err != nil {
+				return err
+			}
 		}
 	}
-	return nil
 }
 
 func copyHeader(key string, dst, src http.Header) {
@@ -293,7 +327,68 @@ func copyHeader(key string, dst, src http.Header) {
 	}
 }
 
+func (s *WebDavStorage) preServe(ctx context.Context) bool {
+	const checkInterval = time.Minute * 3
+	now := time.Now()
+	if s.working.Load() != 1 {
+		if !s.working.CompareAndSwap(0, 2) {
+			return false
+		}
+		s.checkMux.Lock()
+		needCheck := now.Sub(s.lastCheck) > checkInterval
+		if needCheck {
+			s.lastCheck = now
+		}
+		s.checkMux.Unlock()
+		if !needCheck {
+			s.working.Store(0)
+			return false
+		}
+		tctx, cancel := context.WithTimeout(ctx, time.Second*5)
+		err := s.checkAlive(tctx, 0)
+		cancel()
+		if err != nil {
+			s.working.Store(0)
+			return false
+		}
+		log.Warnf("Re-enabled storage %s", s.String())
+		s.working.Store(1)
+	} else {
+		s.checkMux.RLock()
+		lastCheck := s.lastCheck
+		s.checkMux.RUnlock()
+		if now.Sub(lastCheck) > checkInterval {
+			go func() {
+				s.checkMux.Lock()
+				if s.lastCheck != lastCheck {
+					s.checkMux.Unlock()
+					return
+				}
+				s.lastCheck = now
+				s.checkMux.Unlock()
+
+				tctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+				defer cancel()
+				if err := s.checkAlive(tctx, 0); err == nil {
+					s.working.Store(1)
+				} else {
+					log.Errorf("Disabled storage %s: %v", s.String(), err)
+					s.working.Store(0)
+				}
+			}()
+		}
+	}
+	return true
+}
+
 func (s *WebDavStorage) ServeDownload(rw http.ResponseWriter, req *http.Request, hash string, size int64) (int64, error) {
+	if !s.preServe(req.Context()) {
+		return 0, ErrNotWorking
+	}
+	return s.serveDownload(rw, req, hash, size)
+}
+
+func (s *WebDavStorage) serveDownload(rw http.ResponseWriter, req *http.Request, hash string, size int64) (int64, error) {
 	if !s.opt.FollowRedirect && s.opt.RedirectLinkCache > 0 {
 		if location, ok := s.cache.Get(hash); ok {
 			// fix the size for Ranged request
@@ -323,6 +418,7 @@ func (s *WebDavStorage) ServeDownload(rw http.ResponseWriter, req *http.Request,
 		return 0, err
 	}
 	tgReq.SetBasicAuth(s.opt.GetUsername(), s.opt.GetPassword())
+	tgReq.Header.Set("User-Agent", build.ClusterUserAgentFull)
 	rangeH := req.Header.Get("Range")
 	if rangeH != "" {
 		tgReq.Header.Set("Range", rangeH)
@@ -381,14 +477,14 @@ func (s *WebDavStorage) ServeDownload(rw http.ResponseWriter, req *http.Request,
 		copyHeader("Last-Modified", rwh, resp.Header)
 		copyHeader("Content-Length", rwh, resp.Header)
 		if name := req.URL.Query().Get("name"); name != "" {
-			rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+			rwh.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 		}
 		copyHeader("Content-Range", rwh, resp.Header)
 		rw.WriteHeader(resp.StatusCode)
 		n, _ := io.Copy(rw, resp.Body)
 		return n, nil
 	default:
-		return 0, &utils.HTTPStatusError{Code: resp.StatusCode}
+		return 0, utils.NewHTTPStatusErrorFromResponse(resp)
 	}
 }
 
@@ -435,7 +531,7 @@ func (s *WebDavStorage) ServeMeasure(rw http.ResponseWriter, req *http.Request, 
 		fallthrough
 	default:
 		resp.Body.Close()
-		rw.Header().Set("Content-Length", strconv.Itoa(size*utils.MbChunkSize))
+		rwh.Set("Content-Length", strconv.Itoa(size*utils.MbChunkSize))
 		rw.WriteHeader(http.StatusOK)
 		if req.Method == http.MethodGet {
 			for i := 0; i < size; i++ {
@@ -446,7 +542,11 @@ func (s *WebDavStorage) ServeMeasure(rw http.ResponseWriter, req *http.Request, 
 	}
 }
 
-func (s *WebDavStorage) createMeasureFile(ctx context.Context, size int) (err error) {
+func (s *WebDavStorage) createMeasureFile(ctx context.Context, size int) error {
+	if s.measures.Has(size) {
+		// TODO: is this safe?
+		return nil
+	}
 	t := path.Join("measure", strconv.Itoa(size))
 	tsz := (int64)(size) * utils.MbChunkSize
 	if size == 0 {
@@ -464,32 +564,100 @@ func (s *WebDavStorage) createMeasureFile(ctx context.Context, size int) (err er
 		log.Errorf("Cannot get stat of %s: %v", t, err)
 	}
 	log.Infof("Creating measure file at %q", t)
-	if err = s.putFile(t, io.NewSectionReader(utils.EmptyReader, 0, tsz)); err != nil {
+	if err := s.putFile(t, io.NewSectionReader(utils.EmptyReader, 0, tsz)); err != nil {
 		log.Errorf("Cannot create measure file %q: %v", t, err)
-		return
+		return err
 	}
+	s.measures.Set(size, struct{}{})
 	return nil
 }
 
-type YAMLDuration time.Duration
+func (s *WebDavStorage) checkAlive(ctx context.Context, size int) (err error) {
+	var targetSize int64
+	if size == 0 {
+		targetSize = 2
+	} else {
+		targetSize = (int64)(size) * 1024 * 1024
+	}
+	log.Infof("Checking %s for %d bytes ...", s.String(), targetSize)
 
-func (d YAMLDuration) Dur() time.Duration {
-	return (time.Duration)(d)
-}
-
-func (d YAMLDuration) MarshalYAML() (any, error) {
-	return (time.Duration)(d).String(), nil
-}
-
-func (d *YAMLDuration) UnmarshalYAML(n *yaml.Node) (err error) {
-	var v string
-	if err = n.Decode(&v); err != nil {
+	if err = s.createMeasureFile(ctx, size); err != nil {
 		return
 	}
-	var td time.Duration
-	if td, err = time.ParseDuration(v); err != nil {
+	target, err := url.JoinPath(s.opt.GetEndPoint(), "measure", strconv.Itoa(size))
+	if err != nil {
 		return
 	}
-	*d = (YAMLDuration)(td)
-	return nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return
+	}
+	req.SetBasicAuth(s.opt.GetUsername(), s.opt.GetPassword())
+	req.Header.Set("User-Agent", build.ClusterUserAgentFull)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return utils.NewHTTPStatusErrorFromResponse(resp)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != targetSize {
+		return fmt.Errorf("Content-Length not match, got %d, expect %d", resp.ContentLength, targetSize)
+	}
+	start := time.Now()
+	n, err := io.Copy(io.Discard, resp.Body)
+	used := time.Since(start)
+	if err != nil {
+		return fmt.Errorf("WebDavStorage check failed %q: %w", target, err)
+	}
+	if n != targetSize {
+		return fmt.Errorf("Content-Length not match, got %d, expect %d", resp.ContentLength, targetSize)
+	}
+	rate := (float64)(n) / used.Seconds()
+	log.Infof("Check finished for %q, used %v, %s/s", target, used, utils.BytesToUnit(rate))
+	return
+}
+
+func (s *WebDavStorage) CheckUpload(ctx context.Context) (err error) {
+	const fileName = ".check"
+	log.Infof("Checking upload at %s ...", s.String())
+
+	data := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	if err = s.putFileWithClient(http.DefaultClient, fileName, strings.NewReader(data)); err != nil {
+		return err
+	}
+
+	target, err := url.JoinPath(s.opt.GetEndPoint(), fileName)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return
+	}
+	req.SetBasicAuth(s.opt.GetUsername(), s.opt.GetPassword())
+	req.Header.Set("User-Agent", build.ClusterUserAgentFull)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return utils.NewHTTPStatusErrorFromResponse(resp)
+	}
+	res, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	if sres := (string)(res); sres != data {
+		return fmt.Errorf("Content not match, expected %q, got %q", data, sres)
+	}
+
+	if err = s.cli.Remove(fileName); err != nil {
+		return
+	}
+	return
 }

@@ -13,9 +13,11 @@
     "type-check": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@types/pako": "^2.0.3",
     "axios": "^1.6.2",
     "chart.js": "^4.4.1",
     "js-sha256": "^0.11.0",
+    "pako": "^2.1.0",
     "primeicons": "^6.0.1",
     "primevue": "^3.49.0",
     "register-service-worker": "^1.7.2",
@@ -44,6 +46,7 @@
     "vite": "^4.1.4",
     "vite-plugin-pwa": "^0.17.5",
     "vue-tsc": "^1.2.0",
+    "workbox-background-sync": "^7.0.0",
     "workbox-window": "^7.0.0"
   }
 }

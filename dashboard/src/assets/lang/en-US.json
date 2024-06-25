@@ -24,14 +24,46 @@
 		},
 
 		"settings": "Settings",
+		"create-new": "Create new",
+		"edit": "Edit",
+		"operation": "Operation",
+
+		"i18n": "Internationalization",
+		"language": "Language",
+
+		"debugs_and_logs": "Debugs & Logs",
+		"logs": "Logs",
 
 		"notification": "Notification",
 		"notify": {
 			"when.disabled": "Notify when disabled",
 			"when.enabled": "Notify when enabled",
 			"when.sync.done": "Notify when sync finished",
-			"when.update.available": "Notify when updates available"
+			"when.update.available": "Notify when updates available",
+			"report": {
+				"daily": "Report daily requests",
+				"at": "Report at"
+			},
+			"advanced": "Advanced options"
+		},
+
+		"emails": "Emails",
+		"email": {
+			"recver": "Receiver"
+		},
+
+		"webhooks": "Webhooks",
+		"webhook": {
+			"name": "Name",
+			"endpoint": "EndPoint",
+			"scopes": "Scopes",
+			"auth-header": "Auth Header",
+			"configure": "Configure webhook"
 		}
+	},
+	"button": {
+		"enable": "Enable",
+		"disable": "Disable"
 	},
 	"message": {
 		"server": {
@@ -51,9 +83,20 @@
 			"login-to-view": " to view logs"
 		},
 		"settings": {
+			"login": {
+				"auth": "Require authuation",
+				"first": "You have to login before use this feature"
+			},
 			"notify": {
 				"cant.enable": "Cannot enable notification",
 				"denied": "Notification is denied by the browser"
+			},
+			"webpush": {
+				"cant.enable": "Cannot enable Web Push",
+				"denied": "Web Push is denied by the browser"
+			},
+			"filelist": {
+				"cant.fetch": "Cannot fetch filelist"
 			}
 		}
 	},

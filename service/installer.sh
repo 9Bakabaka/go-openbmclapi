@@ -1,4 +1,20 @@
 #!/bin/bash
+# OpenBmclAPI (Golang Edition)
+# Copyright (C) 2024 Kevin Z <zyxkad@gmail.com>
+# All rights reserved
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU Affero General Public License as published
+#  by the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU Affero General Public License for more details.
+#
+#  You should have received a copy of the GNU Affero General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # if [ $(id -u) -ne 0 ]; then
 # 	echo -e "\e[31mERROR: Not root user\e[0m"
@@ -8,14 +24,14 @@
 ARGS=()
 
 while [ $# -gt 0 ]; do
-  case "$1" in
-  	-m|--mirror)
+	case "$1" in
+		-m|--mirror)
 			shift
 			MIRROR_PREFIX=$1
 			;;
 		-t|--tag)
 			shift
-			LATEST_TAG=$1
+			TARGET_TAG=$1
 			;;
 		-*)
 			echo -e "\e[31mERROR: Unknown option $1\e[0m"
@@ -29,7 +45,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ ${#ARGS[@]} -ge 1 ]; then
-	LATEST_TAG="${ARGS[0]}"
+	TARGET_TAG="${ARGS[0]}"
 fi
 
 if [ -n "$MIRROR_PREFIX" ] && [[ "$MIRROR_PREFIX" != */ ]]; then
@@ -37,7 +53,7 @@ if [ -n "$MIRROR_PREFIX" ] && [[ "$MIRROR_PREFIX" != */ ]]; then
 fi
 
 echo "MIRROR_PREFIX=${MIRROR_PREFIX}"
-echo "LATEST_TAG=${LATEST_TAG}"
+echo "TARGET_TAG=${TARGET_TAG}"
 
 REPO='LiterMC/go-openbmclapi'
 RAW_PREFIX="${MIRROR_PREFIX}https://raw.githubusercontent.com"
@@ -60,7 +76,7 @@ if ! id $USERNAME >/dev/null 2>&1; then
 	useradd $USERNAME || {
 		echo -e "\e[31mERROR: Could not create user $USERNAME\e[0m"
 		exit 1
-  	}
+	}
 fi
 
 
@@ -105,7 +121,7 @@ if [ ! -n "$TARGET_TAG" ]; then
 	echo
 fi
 
-fetchBlob service/go-openbmclapi.service /usr/lib/systemd/system/go-openbmclapi.service 0644 || exit $?
+fetchBlob installer/service/go-openbmclapi.service /usr/lib/systemd/system/go-openbmclapi.service 0644 || exit $?
 
 [ -d "$BASE_PATH" ] || { mkdir -p "$BASE_PATH" && chmod 0755 "$BASE_PATH" && chown $USERNAME "$BASE_PATH"; } || exit $?
 
@@ -115,23 +131,23 @@ fetchBlob service/go-openbmclapi.service /usr/lib/systemd/system/go-openbmclapi.
 
 ARCH=$(uname -m)
 case "$ARCH" in
-    amd64|x86_64)
-        ARCH="amd64"
-    ;;
-    i386|i686)
-        ARCH="386"
-    ;;
-    aarch64|armv8|arm64)
-        ARCH="arm64"
-    ;;
-    armv7l|armv6|armv7)
-        ARCH="arm"
-    ;;
-    *)
-        echo -e "\e[31m
+	amd64|x86_64)
+		ARCH="amd64"
+	;;
+	i386|i686)
+		ARCH="386"
+	;;
+	aarch64|armv8|arm64)
+		ARCH="arm64"
+	;;
+	armv7l|armv6|armv7)
+		ARCH="arm"
+	;;
+	*)
+		echo -e "\e[31m
 Unknown CPU architecture: $ARCH
 Please report to https://github.com/LiterMC/go-openbmclapi/issues/new\e[0m"
-        exit 1
+		exit 1
 esac
 
 source="${MIRROR_PREFIX}https://github.com/$REPO/releases/download/$TARGET_TAG/go-openbmclapi-linux-$ARCH"

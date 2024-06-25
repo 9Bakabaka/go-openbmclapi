@@ -20,10 +20,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto"
+	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,13 +34,12 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
-	"path"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LiterMC/go-openbmclapi/internal/build"
+	"github.com/LiterMC/go-openbmclapi/limited"
 	"github.com/LiterMC/go-openbmclapi/log"
 	"github.com/LiterMC/go-openbmclapi/storage"
 	"github.com/LiterMC/go-openbmclapi/utils"
@@ -50,59 +50,6 @@ func init() {
 	log.AddStdLogFilter(func(line []byte) bool {
 		return bytes.HasPrefix(line, ([]byte)("http: TLS handshake error"))
 	})
-}
-
-type statusResponseWriter struct {
-	http.ResponseWriter
-	status int
-	wrote  int64
-}
-
-var _ http.Hijacker = (*statusResponseWriter)(nil)
-
-func getCaller() (caller runtime.Frame) {
-	pc := make([]uintptr, 16)
-	n := runtime.Callers(3, pc)
-	frames := runtime.CallersFrames(pc[:n])
-	frame, more := frames.Next()
-	_ = more
-	return frame
-}
-
-func (w *statusResponseWriter) WriteHeader(status int) {
-	if w.status == 0 {
-		w.status = status
-		w.ResponseWriter.WriteHeader(status)
-	} else {
-		caller := getCaller()
-		log.Warnf("http: superfluous response.WriteHeader call with status %d from %s (%s:%d)",
-			status, caller.Function, path.Base(caller.File), caller.Line)
-	}
-}
-
-func (w *statusResponseWriter) Write(buf []byte) (n int, err error) {
-	n, err = w.ResponseWriter.Write(buf)
-	w.wrote += (int64)(n)
-	return
-}
-
-func (w *statusResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
-	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
-		n, err = rf.ReadFrom(r)
-		w.wrote += n
-		return
-	}
-	n, err = io.Copy(w.ResponseWriter, r)
-	w.wrote += n
-	return
-}
-
-func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	h, ok := w.ResponseWriter.(http.Hijacker)
-	if ok {
-		return h.Hijack()
-	}
-	return nil, nil, errors.New("ResponseWriter is not http.Hijacker")
 }
 
 const (
@@ -155,9 +102,9 @@ func (r *accessRecord) String() string {
 		used = used.Truncate(time.Microsecond)
 	}
 	var buf strings.Builder
-	fmt.Fprintf(&buf, "Serve %3d | %12v | %7s | %-15s | %s | %-4s %s | %q",
+	fmt.Fprintf(&buf, "Serve %3d | %12v | %7s | %-15s | %-4s %s | %q",
 		r.Status, used, utils.BytesToUnit((float64)(r.Content)),
-		r.Addr, r.Proto,
+		r.Addr,
 		r.Method, r.URI, r.UA)
 	if len(r.Extra) > 0 {
 		buf.WriteString(" | ")
@@ -169,12 +116,16 @@ func (r *accessRecord) String() string {
 }
 
 func (cr *Cluster) GetHandler() http.Handler {
+	cr.apiRateLimiter = limited.NewAPIRateMiddleWare(RealAddrCtxKey, loggedUserKey)
+	cr.apiRateLimiter.SetAnonymousRateLimit(config.RateLimit.Anonymous)
+	cr.apiRateLimiter.SetLoggedRateLimit(config.RateLimit.Logged)
 	cr.handlerAPIv0 = http.StripPrefix("/api/v0", cr.cliIdHandle(cr.initAPIv0()))
+	cr.handlerAPIv1 = http.StripPrefix("/api/v1", cr.cliIdHandle(cr.initAPIv1()))
 	cr.hijackHandler = http.StripPrefix("/bmclapi", cr.hijackProxy)
 
-	handler := NewHttpMiddleWareHandler(cr)
+	handler := utils.NewHttpMiddleWareHandler(cr)
 	// recover panic and log it
-	handler.Use(func(rw http.ResponseWriter, req *http.Request, next http.Handler) {
+	handler.UseFunc(func(rw http.ResponseWriter, req *http.Request, next http.Handler) {
 		defer log.RecoverPanic(func(any) {
 			rw.WriteHeader(http.StatusInternalServerError)
 		})
@@ -183,7 +134,7 @@ func (cr *Cluster) GetHandler() http.Handler {
 
 	if !config.Advanced.DoNotRedirectHTTPSToSecureHostname {
 		// rediect the client to the first public host if it is connecting with a unsecure host
-		handler.Use(func(rw http.ResponseWriter, req *http.Request, next http.Handler) {
+		handler.UseFunc(func(rw http.ResponseWriter, req *http.Request, next http.Handler) {
 			host, _, err := net.SplitHostPort(req.Host)
 			if err != nil {
 				host = req.Host
@@ -232,16 +183,18 @@ func (cr *Cluster) GetHandler() http.Handler {
 	return handler
 }
 
-func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
+func (cr *Cluster) getRecordMiddleWare() utils.MiddleWareFunc {
 	type record struct {
-		used    float64
-		bytes   float64
-		ua      string
-		isRange bool
+		used   float64
+		bytes  float64
+		ua     string
+		skipUA bool
 	}
 	recordCh := make(chan record, 1024)
 
 	go func() {
+		defer log.RecoverPanic(nil)
+
 		<-cr.WaitForEnable()
 		disabled := cr.Disabled()
 
@@ -257,9 +210,9 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 		for {
 			select {
 			case <-updateTicker.C:
-				cr.stats.mux.Lock()
+				cr.stats.Lock()
 
-				log.Infof("Served %d requests, total responsed body = %s, total used CPU time = %.2fs",
+				log.Infof("Served %d requests, total responsed body = %s, total IO waiting time = %.2fs",
 					total, utils.BytesToUnit(totalBytes), totalUsed)
 				for ua, v := range uas {
 					if ua == "" {
@@ -273,12 +226,12 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 				totalBytes = 0
 				clear(uas)
 
-				cr.stats.mux.Unlock()
+				cr.stats.Unlock()
 			case rec := <-recordCh:
 				total++
 				totalUsed += rec.used
 				totalBytes += rec.bytes
-				if !rec.isRange {
+				if !rec.skipUA {
 					uas[rec.ua]++
 				}
 			case <-disabled:
@@ -308,7 +261,7 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 		if addr == "" {
 			addr, _, _ = net.SplitHostPort(req.RemoteAddr)
 		}
-		srw := &statusResponseWriter{ResponseWriter: rw}
+		srw := utils.WrapAsStatusResponseWriter(rw)
 		start := time.Now()
 
 		log.LogAccess(log.LevelDebug, &preAccessRecord{
@@ -331,9 +284,9 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 		used := time.Since(start)
 		accRec := &accessRecord{
 			Type:    "access",
-			Status:  srw.status,
+			Status:  srw.Status,
 			Used:    used,
-			Content: srw.wrote,
+			Content: srw.Wrote,
 			Addr:    addr,
 			Proto:   req.Proto,
 			Method:  req.Method,
@@ -345,7 +298,7 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 		}
 		log.LogAccess(log.LevelInfo, accRec)
 
-		if srw.status < 200 || 400 <= srw.status {
+		if srw.Status < 200 || 400 <= srw.Status {
 			return
 		}
 		if !strings.HasPrefix(req.URL.Path, "/download/") {
@@ -353,15 +306,46 @@ func (cr *Cluster) getRecordMiddleWare() MiddleWareFunc {
 		}
 		var rec record
 		rec.used = used.Seconds()
-		rec.bytes = (float64)(srw.wrote)
+		rec.bytes = (float64)(srw.Wrote)
 		ua, _, _ = strings.Cut(ua, " ")
 		rec.ua, _, _ = strings.Cut(ua, "/")
-		rec.isRange = extraInfoMap["skip-ua-count"] != nil
+		rec.skipUA = extraInfoMap["skip-ua-count"] != nil
 		select {
 		case recordCh <- rec:
 		default:
 		}
 	}
+}
+
+func (cr *Cluster) checkQuerySign(req *http.Request, hash string, secret string) bool {
+	if config.Advanced.SkipSignatureCheck {
+		return true
+	}
+	query := req.URL.Query()
+	sign, e := query.Get("s"), query.Get("e")
+	if len(sign) == 0 || len(e) == 0 {
+		return false
+	}
+	before, err := strconv.ParseInt(e, 36, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().UnixMilli() > before {
+		return false
+	}
+	hs := crypto.SHA1.New()
+	io.WriteString(hs, secret)
+	io.WriteString(hs, hash)
+	io.WriteString(hs, e)
+	var (
+		buf  [20]byte
+		sbuf [27]byte
+	)
+	base64.RawURLEncoding.Encode(sbuf[:], hs.Sum(buf[:0]))
+	if (string)(sbuf[:]) != sign {
+		return false
+	}
+	return true
 }
 
 var emptyHashes = func() (hashes map[string]struct{}) {
@@ -377,6 +361,9 @@ var emptyHashes = func() (hashes map[string]struct{}) {
 }()
 
 var HeaderXPoweredBy = fmt.Sprintf("go-openbmclapi/%s; url=https://github.com/LiterMC/go-openbmclapi", build.BuildVersion)
+
+//go:embed robots.txt
+var robotTxtContent string
 
 func (cr *Cluster) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	method := req.Method
@@ -399,8 +386,7 @@ func (cr *Cluster) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		query := req.URL.Query()
-		if !checkQuerySign(hash, cr.clusterSecret, query) {
+		if !cr.checkQuerySign(req, hash, cr.clusterSecret) {
 			http.Error(rw, "Cannot verify signature", http.StatusForbidden)
 			return
 		}
@@ -421,8 +407,7 @@ func (cr *Cluster) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		query := req.URL.Query()
-		if !checkQuerySign(u.Path, cr.clusterSecret, query) {
+		if !cr.checkQuerySign(req, u.Path, cr.clusterSecret) {
 			http.Error(rw, "Cannot verify signature", http.StatusForbidden)
 			return
 		}
@@ -447,7 +432,13 @@ func (cr *Cluster) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		case "v0":
 			cr.handlerAPIv0.ServeHTTP(rw, req)
 			return
+		case "v1":
+			cr.handlerAPIv1.ServeHTTP(rw, req)
+			return
 		}
+	case rawpath == "/robots.txt":
+		http.ServeContent(rw, req, "robots.txt", time.Time{}, strings.NewReader(robotTxtContent))
+		return
 	case strings.HasPrefix(rawpath, "/dashboard/"):
 		if !config.Dashboard.Enable {
 			http.NotFound(rw, req)
@@ -480,11 +471,9 @@ func (cr *Cluster) handleDownload(rw http.ResponseWriter, req *http.Request, has
 			rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 		}
 		rw.WriteHeader(http.StatusOK)
-		if keepaliveRec {
-			cr.hits.Add(1)
-			// cr.hbts.Add(0) // no need to add zero
-		} else {
-			cr.statHits.Add(1)
+		cr.stats.AddHits(1, 0, "")
+		if !keepaliveRec {
+			cr.statOnlyHits.Add(1)
 		}
 		return
 	}
@@ -500,12 +489,13 @@ func (cr *Cluster) handleDownload(rw http.ResponseWriter, req *http.Request, has
 	size, ok := cr.CachedFileSize(hash)
 	if !ok {
 		if err := cr.DownloadFile(req.Context(), hash); err != nil {
-			http.Error(rw, "404 not found", http.StatusNotFound)
+			// TODO: check if the file exists
+			http.Error(rw, "Cannot download file from center server: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	var sto storage.Storage
-	forEachFromRandomIndexWithPossibility(cr.storageWeights, cr.storageTotalWeight, func(i int) bool {
+	if forEachFromRandomIndexWithPossibility(cr.storageWeights, cr.storageTotalWeight, func(i int) bool {
 		sto = cr.storages[i]
 		log.Debugf("[handler]: Checking %s on storage [%d] %s ...", hash, i, sto.String())
 
@@ -516,16 +506,17 @@ func (cr *Cluster) handleDownload(rw http.ResponseWriter, req *http.Request, has
 			return false
 		}
 		if sz >= 0 {
-			if keepaliveRec {
-				cr.hits.Add(1)
-				cr.hbts.Add(sz)
-			} else {
-				cr.statHits.Add(1)
-				cr.statHbts.Add(sz)
+			opts := cr.storageOpts[i]
+			cr.stats.AddHits(1, sz, opts.Id)
+			if !keepaliveRec {
+				cr.statOnlyHits.Add(1)
+				cr.statOnlyHbts.Add(sz)
 			}
 		}
 		return true
-	})
+	}) {
+		err = nil
+	}
 	if sto != nil {
 		SetAccessInfo(req, "storage", sto.String())
 	}
@@ -539,6 +530,13 @@ func (cr *Cluster) handleDownload(rw http.ResponseWriter, req *http.Request, has
 			http.Error(rw, err.Error(), http.StatusBadGateway)
 		} else {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		}
+		if err == storage.ErrNotWorking {
+			log.Errorf("All storages are down, exit.")
+			tctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+			cr.Disable(tctx)
+			cancel()
+			osExit(CodeClientOrEnvionmentError)
 		}
 		return
 	}
@@ -563,48 +561,4 @@ func parseRangeFirstStart(rg string) (start int64, ok bool) {
 		return 0, false
 	}
 	return start, true
-}
-
-type MiddleWareFunc func(rw http.ResponseWriter, req *http.Request, next http.Handler)
-
-type httpMiddleWareHandler struct {
-	final   http.Handler
-	middles []MiddleWareFunc
-}
-
-func NewHttpMiddleWareHandler(final http.Handler) *httpMiddleWareHandler {
-	return &httpMiddleWareHandler{
-		final: final,
-	}
-}
-
-func (m *httpMiddleWareHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	i := 0
-	var getNext func() http.Handler
-	getNext = func() http.Handler {
-		j := i
-		if j > len(m.middles) {
-			// unreachable
-			panic("httpMiddleWareHandler: called getNext too much times")
-		}
-		i++
-		if j == len(m.middles) {
-			return m.final
-		}
-		mid := m.middles[j]
-
-		called := false
-		return (http.HandlerFunc)(func(rw http.ResponseWriter, req *http.Request) {
-			if called {
-				panic("httpMiddleWareHandler: Called next function twice")
-			}
-			called = true
-			mid(rw, req, getNext())
-		})
-	}
-	getNext().ServeHTTP(rw, req)
-}
-
-func (m *httpMiddleWareHandler) Use(fns ...MiddleWareFunc) {
-	m.middles = append(m.middles, fns...)
 }

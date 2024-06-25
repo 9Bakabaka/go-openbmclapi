@@ -150,7 +150,7 @@ func (s *LocalStorage) ServeDownload(rw http.ResponseWriter, req *http.Request, 
 		}
 	}
 
-	if !isGzip && rw.Header().Get("Range") != "" {
+	if !isGzip && req.Header.Get("Range") != "" {
 		fd, err := os.Open(path)
 		if err != nil {
 			return 0, err
@@ -227,5 +227,16 @@ func (s *LocalStorage) ServeMeasure(rw http.ResponseWriter, req *http.Request, s
 			rw.Write(utils.MbChunk[:])
 		}
 	}
+	return nil
+}
+
+func (s *LocalStorage) CheckUpload(ctx context.Context) (err error) {
+	const fileName = ".check"
+
+	data := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	if err = os.WriteFile(filepath.Join(s.opt.CachePath, fileName), ([]byte)(data), 0600); err != nil {
+		return
+	}
+	os.Remove(fileName)
 	return nil
 }
